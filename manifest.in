@@ -1,0 +1,8 @@
+include README.md
+include LICENSE
+include looker_validator_config.yaml
+recursive-include looker_validator/templates *
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude *.so
+global-exclude .git*

@@ -1,0 +1,29 @@
+# Build artifacts
+build/
+dist/
+*.egg-info/
+bdist.win-amd64/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Logs directory (usually temporary)
+logs/
+
+# Virtual environment (if you use one)
+venv/
+.venv/
+env/
+*.env
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDE specific files (optional)
+.vscode/
+.idea/
+
+# Configuration file (IMPORTANT!)
+looker_validator_config.yaml
