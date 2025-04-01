@@ -1,12 +1,12 @@
 """
-Command-line interface for Looker Validator.
+Command-line interface for Looker Validator with enhanced environment variable support.
 """
 
 import os
 import sys
 import logging
 import click
-from typing import Any, Callable, Optional
+from typing import List, Optional, Any, Callable
 
 from looker_validator.config import Config
 from looker_validator.connection import LookerConnection
@@ -22,6 +22,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("looker_validator")
 
+
+# Enhanced Click Option classes for environment variables
 class EnvVarOption(click.Option):
     """Click option that can be set from an environment variable.
     
@@ -98,7 +100,7 @@ def env_var_flag(*param_decls, **attrs):
     return click.option(*param_decls, cls=EnvVarFlag, **attrs)
 
 
-# Example usage for common options:
+# Shared command options with environment variable support
 def common_options(f: Callable) -> Callable:
     """Common options for all commands with environment variable support."""
     f = env_var_option(
@@ -186,126 +188,60 @@ def common_options(f: Callable) -> Callable:
     )(f)
     return f
 
-# Shared command options
-def common_options(f):
-    """Common options for all commands."""
-    f = click.option(
-        "--config-file", "-c",
-        help="Path to YAML config file",
-        type=click.Path(exists=True, dir_okay=False)
-    )(f)
-    f = click.option(
-        "--base-url",
-        help="Looker instance URL (e.g., https://company.looker.com)"
-    )(f)
-    f = click.option(
-        "--client-id",
-        help="Looker API client ID"
-    )(f)
-    f = click.option(
-        "--client-secret",
-        help="Looker API client secret"
-    )(f)
-    f = click.option(
-        "--port",
-        help="Looker API port",
-        type=int
-    )(f)
-    f = click.option(
-        "--api-version",
-        help="Looker API version",
-        default="4.0",
-        show_default=True
-    )(f)
-    f = click.option(
-        "--project",
-        help="Looker project name",
-        required=True
-    )(f)
-    f = click.option(
-        "--branch",
-        help="Git branch name (default: production)"
-    )(f)
-    f = click.option(
-        "--commit-ref",
-        help="Git commit reference"
-    )(f)
-    f = click.option(
-        "--remote-reset",
-        help="Reset branch to remote state",
-        is_flag=True
-    )(f)
-    f = click.option(
-        "--log-dir",
-        help="Directory for log files",
-        default="logs",
-        show_default=True
-    )(f)
-    f = click.option(
-        "--verbose", "-v",
-        help="Enable verbose logging",
-        is_flag=True
-    )(f)
-    f = click.option(
-        "--pin-imports",
-        help="Pin imported projects to specific refs (format: 'project:ref,project2:ref2')"
-    )(f)
-    f = click.option(
-        "--timeout",
-        help="API request timeout in seconds",
-        type=int,
-        default=600,
-        show_default=True
-    )(f)
-    return f
-
 
 # Create the CLI group
 @click.group()
+@click.version_option(message="Looker Validator v%(version)s")
 def cli():
     """Looker Validator - A continuous integration tool for Looker and LookML."""
     pass
 
 
 @cli.command()
-@click.option(
+@env_var_option(
     "--config-file", "-c",
     help="Path to YAML config file",
-    type=click.Path(exists=True, dir_okay=False)
+    type=click.Path(exists=True, dir_okay=False),
+    env_var="LOOKER_CONFIG_FILE"
 )
-@click.option(
+@env_var_option(
     "--base-url",
-    help="Looker instance URL (e.g., https://company.looker.com)"
+    help="Looker instance URL (e.g., https://company.looker.com)",
+    env_var="LOOKER_BASE_URL",
+    required=True
 )
-@click.option(
+@env_var_option(
     "--client-id",
-    help="Looker API client ID"
+    help="Looker API client ID",
+    env_var="LOOKER_CLIENT_ID",
+    required=True
 )
-@click.option(
+@env_var_option(
     "--client-secret",
-    help="Looker API client secret"
+    help="Looker API client secret",
+    env_var="LOOKER_CLIENT_SECRET",
+    required=True
 )
-@click.option(
+@env_var_option(
     "--port",
     help="Looker API port",
-    type=int
+    type=int,
+    env_var="LOOKER_PORT"
 )
-@click.option(
+@env_var_option(
     "--api-version",
     help="Looker API version",
     default="4.0",
-    show_default=True
+    show_default=True,
+    env_var="LOOKER_API_VERSION"
 )
-@click.option(
-    "--project",
-    help="Looker project name"
-)  # Note: Not required for connect
-@click.option(
+@env_var_option(
     "--timeout",
     help="API request timeout in seconds",
     type=int,
     default=600,
-    show_default=True
+    show_default=True,
+    env_var="LOOKER_TIMEOUT"
 )
 def connect(**kwargs):
     """Test connection to Looker API."""
@@ -342,55 +278,60 @@ def connect(**kwargs):
 
 @cli.command()
 @common_options
-@click.option(
+@env_var_option(
     "--explores",
     help="Model/explore selectors (e.g., 'model_a/*', '-model_b/explore_c')",
-    multiple=True
+    multiple=True,
+    env_var="LOOKER_EXPLORES"
 )
-@click.option(
+@env_var_option(
     "--concurrency",
     help="Number of concurrent queries",
     type=int,
     default=10,
-    show_default=True
+    show_default=True,
+    env_var="LOOKER_CONCURRENCY"
 )
-@click.option(
+@env_var_flag(
     "--fail-fast",
     help="Only run explore-level queries",
-    is_flag=True
+    env_var="LOOKER_FAIL_FAST"
 )
-@click.option(
+@env_var_flag(
     "--profile", "-p",
     help="Profile query execution time",
-    is_flag=True
+    env_var="LOOKER_PROFILE"
 )
-@click.option(
+@env_var_option(
     "--runtime-threshold",
     help="Runtime threshold for profiler (seconds)",
     type=int,
     default=5,
-    show_default=True
+    show_default=True,
+    env_var="LOOKER_RUNTIME_THRESHOLD"
 )
-@click.option(
+@env_var_flag(
     "--incremental",
     help="Only show errors unique to the branch",
-    is_flag=True
+    env_var="LOOKER_INCREMENTAL"
 )
-@click.option(
+@env_var_option(
     "--target",
-    help="Target branch for incremental comparison (default: production)"
+    help="Target branch for incremental comparison (default: production)",
+    env_var="LOOKER_TARGET"
 )
-@click.option(
+@env_var_flag(
     "--ignore-hidden",
     help="Ignore hidden dimensions",
-    is_flag=True
+    env_var="LOOKER_IGNORE_HIDDEN"
 )
-@click.option(
+@env_var_option(
     "--chunk-size",
     help="Maximum number of dimensions per query",
     type=int,
     default=500,
-    show_default=True
+    show_default=True,
+    env_var="LOOKER_CHUNK_SIZE"
 )
 def sql(**kwargs):
     """Run SQL validation on Looker project."""
@@ -448,29 +389,32 @@ def sql(**kwargs):
 
 @cli.command()
 @common_options
-@click.option(
+@env_var_option(
     "--explores",
     help="Model/explore selectors (e.g., 'model_a/*', '-model_b/explore_c')",
-    multiple=True
+    multiple=True,
+    env_var="LOOKER_EXPLORES"
 )
-@click.option(
+@env_var_option(
     "--folders",
     help="Folder IDs to include/exclude (e.g., '25', '-33')",
-    multiple=True
+    multiple=True,
+    env_var="LOOKER_FOLDERS"
 )
-@click.option(
+@env_var_flag(
     "--exclude-personal",
     help="Exclude content in personal folders",
-    is_flag=True
+    env_var="LOOKER_EXCLUDE_PERSONAL"
 )
-@click.option(
+@env_var_flag(
     "--incremental",
     help="Only show errors unique to the branch",
-    is_flag=True
+    env_var="LOOKER_INCREMENTAL"
 )
-@click.option(
+@env_var_option(
     "--target",
-    help="Target branch for incremental comparison (default: production)"
+    help="Target branch for incremental comparison (default: production)",
+    env_var="LOOKER_TARGET"
 )
 def content(**kwargs):
     """Run content validation on Looker project."""
@@ -524,10 +468,19 @@ def content(**kwargs):
 
 @cli.command(name="assert")  # Use name parameter to override the function name
 @common_options
-@click.option(
+@env_var_option(
     "--explores",
     help="Model/explore selectors (e.g., 'model_a/*', '-model_b/explore_c')",
-    multiple=True
+    multiple=True,
+    env_var="LOOKER_EXPLORES"
+)
+@env_var_option(
+    "--concurrency",
+    help="Number of concurrent test executions",
+    type=int,
+    default=15,
+    show_default=True,
+    env_var="LOOKER_CONCURRENCY"
 )
 def assert_command(**kwargs):
     """Run LookML data tests on Looker project."""
@@ -559,6 +512,7 @@ def assert_command(**kwargs):
             explores=config.explores,
             log_dir=config.log_dir,
             pin_imports=config.pin_imports,
+            concurrency=kwargs.get("concurrency", 15)
         )
         
         success = validator.validate()
@@ -574,21 +528,24 @@ def assert_command(**kwargs):
             click.echo(traceback.format_exc())
         sys.exit(1)
 
+
 @cli.command()
 @common_options
-@click.option(
+@env_var_option(
     "--severity",
     help="Severity threshold (info, warning, error)",
     type=click.Choice(["info", "warning", "error"]),
     default="warning",
-    show_default=True
+    show_default=True,
+    env_var="LOOKER_SEVERITY"
 )
-@click.option(
+@env_var_option(
     "--timeout",
     help="Request timeout in seconds (handled by connection settings)",
     type=int,
     default=7200,  # 2 hour default for large projects
-    show_default=True
+    show_default=True,
+    env_var="LOOKER_LOOKML_TIMEOUT"
 )
 def lookml(**kwargs):
     """Run LookML validation on Looker project."""
@@ -603,7 +560,7 @@ def lookml(**kwargs):
             client_secret=config.client_secret,
             port=config.port,
             api_version=config.api_version,
-            timeout=config.timeout,  # Use the global timeout setting
+            timeout=config.timeout,
         )
         
         # Set log level if verbose
