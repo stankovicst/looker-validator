@@ -426,67 +426,73 @@ class SQLValidator(BaseValidator):
         """
         if not dimension_names:
             return True, None
-            
+        
         # Create query with all dimensions - use API 4.0 models
-        query = models40.WriteQuery(
-            model=model,
-            view=explore,
-            fields=dimension_names,
-            filters={"1": "2"},  # WHERE 1=2 to prevent data processing
-            limit=0  # LIMIT 0 to prevent data fetching
-        )
+        # Use a valid filter field from the explore or just rely on limit=0
+        try:
+            # First try without filters, just using limit=0
+            query = models40.WriteQuery(
+                model=model,
+                view=explore,
+                fields=dimension_names,
+                limit=0  # LIMIT 0 to prevent data fetching
+            )
         
-        start_time = time.time()
-        retries = 0
+            start_time = time.time()
+            retries = 0
         
-        while retries <= self.max_retries:
-            try:
-                # Execute query
-                response = self.sdk.run_inline_query("sql", query)
+            while retries <= self.max_retries:
+                try:
+                    # Execute query
+                    response = self.sdk.run_inline_query("sql", query)
                 
-                # Profile query if enabled
-                if self.profile:
-                    elapsed = time.time() - start_time
-                    if elapsed >= self.runtime_threshold:
-                        self._add_profile_result(
-                            "explore",
-                            f"{model}.{explore}",
-                            elapsed,
-                            None
-                        )
+                    # Profile query if enabled
+                    if self.profile:
+                        elapsed = time.time() - start_time
+                        if elapsed >= self.runtime_threshold:
+                            self._add_profile_result(
+                                "explore",
+                                f"{model}.{explore}",
+                                elapsed,
+                                None
+                            )
                 
-                return True, None
+                    return True, None
                 
-            except Exception as e:
-                retries += 1
-                error_message = str(e)
+                except Exception as e:
+                    retries += 1
+                    error_message = str(e)
                 
-                # Profile query if enabled
-                if self.profile:
-                    elapsed = time.time() - start_time
-                    if elapsed >= self.runtime_threshold:
-                        self._add_profile_result(
-                            "explore",
-                            f"{model}.{explore}",
-                            elapsed,
-                            None
-                        )
+                    # Profile query if enabled
+                    if self.profile:
+                        elapsed = time.time() - start_time
+                        if elapsed >= self.runtime_threshold:
+                            self._add_profile_result(
+                                "explore",
+                                f"{model}.{explore}",
+                                elapsed,
+                                None
+                            )
                 
-                # Check for SQL error
-                if "SQL ERROR" in error_message:
-                    return False, error_message
-                elif retries <= self.max_retries:
-                    # If it's a timeout or temporary error, retry
-                    if "timeout" in error_message.lower() or "502" in error_message or "504" in error_message:
-                        logger.info(f"Retry {retries}/{self.max_retries} for {model}/{explore} due to: {error_message}")
-                        time.sleep(2 ** retries)  # Exponential backoff
-                        continue
-                    else:
-                        logger.error(f"Non-SQL error in {model}/{explore}: {error_message}")
+                    # Check for SQL error
+                    if "SQL ERROR" in error_message:
                         return False, error_message
-                else:
-                    logger.error(f"Max retries exceeded for {model}/{explore}: {error_message}")
-                    return False, f"Max retries exceeded: {error_message}"
+                    elif retries <= self.max_retries:
+                        # If it's a timeout or temporary error, retry
+                        if "timeout" in error_message.lower() or "502" in error_message or "504" in error_message:
+                            logger.info(f"Retry {retries}/{self.max_retries} for {model}/{explore} due to: {error_message}")
+                            time.sleep(2 ** retries)  # Exponential backoff
+                            continue
+                        else:
+                            logger.error(f"Non-SQL error in {model}/{explore}: {error_message}")
+                            return False, error_message
+                    else:
+                        logger.error(f"Max retries exceeded for {model}/{explore}: {error_message}")
+                        return False, f"Max retries exceeded: {error_message}"
+        except Exception as outer_e:
+            logger.error(f"Error creating query for {model}/{explore}: {str(outer_e)}")
+            return False, str(outer_e)
+    
 
     def _run_dimension_queries(self):
         """Run dimension-level queries for failing explores using binary search."""

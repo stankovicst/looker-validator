@@ -118,9 +118,9 @@ class LookerConnection:
                 # Set development mode and checkout the branch
                 self.sdk.update_session(models40.WriteApiSession(workspace_id="dev"))
             
-                # Create a proper body for the API call
+                # Create a body and checkout the branch (CORRECTED)
                 body = models40.WriteGitBranch(name=branch)
-                self.sdk.update_git_branch(project, branch, body=body)
+                self.sdk.update_git_branch(project, body=body)
             else:
                 logger.info(f"Using production branch for project {project}")
                 self.sdk.update_session(models40.WriteApiSession(workspace_id="production"))
@@ -151,9 +151,9 @@ class LookerConnection:
                 body=models40.WriteGitBranch(name=temp_branch, ref=commit_ref)
             )
             
-            # Checkout the temp branch - Fixed: Added body parameter
+            # Checkout the temp branch (CORRECTED)
             body = models40.WriteGitBranch(name=temp_branch)
-            self.sdk.update_git_branch(project, temp_branch, body=body)
+            self.sdk.update_git_branch(project, body=body)
             
             return temp_branch
         except Exception as e:
@@ -169,10 +169,10 @@ class LookerConnection:
         """
         try:
             logger.info(f"Resetting branch {branch} to remote for project {project}")
-            # First set development mode and checkout the branch - Fixed: Added body parameter
+            # First set development mode and checkout the branch (CORRECTED)
             self.sdk.update_session(models40.WriteApiSession(workspace_id="dev"))
             body = models40.WriteGitBranch(name=branch)
-            self.sdk.update_git_branch(project, branch, body=body)
+            self.sdk.update_git_branch(project, body=body)
             
             # Reset to remote
             self.sdk.reset_git_branch(project)
