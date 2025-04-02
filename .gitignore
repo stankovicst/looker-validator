@@ -24,7 +24,6 @@ Thumbs.db
 # IDE specific files (optional)
 .vscode/
 .idea/
-.gitignore/
 
 # Configuration file (IMPORTANT!)
 looker_validator_config.yaml

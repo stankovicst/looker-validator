@@ -1,5 +1,11 @@
 from setuptools import setup, find_packages
 import os
+import re
+
+# Read version from __init__.py
+with open(os.path.join("looker_validator", "__init__.py"), "r", encoding="utf-8") as f:
+    version_match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', f.read())
+    version = version_match.group(1) if version_match else "0.1.0"
 
 # Read the content of README.md
 with open("README.md", "r", encoding="utf-8") as fh:
@@ -7,7 +13,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="looker-validator",
-    version="0.1.0",
+    version=version,
     packages=find_packages(),
     include_package_data=True,
     install_requires=[
@@ -18,6 +24,17 @@ setup(
         "requests>=2.28.0",
         "colorama>=0.4.6",
     ],
+    extras_require={
+        "dev": [
+            "pytest>=7.0.0",
+            "pytest-cov>=4.0.0",
+            "black>=23.0.0",
+            "flake8>=6.0.0",
+            "mypy>=1.0.0",
+            "build>=0.10.0",
+            "twine>=4.0.0",
+        ],
+    },
     entry_points={
         "console_scripts": [
             "looker-validator=looker_validator.cli:main",
@@ -33,6 +50,8 @@ setup(
     url="https://github.com/stankovicst/looker-validator",
     project_urls={
         "Bug Tracker": "https://github.com/stankovicst/looker-validator/issues",
+        "Documentation": "https://github.com/stankovicst/looker-validator#readme",
+        "Source Code": "https://github.com/stankovicst/looker-validator",
     },
     classifiers=[
         "Development Status :: 3 - Alpha",
@@ -42,6 +61,8 @@ setup(
         "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
         "License :: OSI Approved :: MIT License",
+        "Operating System :: OS Independent",
     ],
 )
