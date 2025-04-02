@@ -12,4 +12,4 @@ Validators:
 - LookML Validator: Runs Looker's LookML Validator to test for syntax errors
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.3"

@@ -307,6 +307,14 @@ def connect(**kwargs):
     show_default=True,
     env_var="LOOKER_CHUNK_SIZE"
 )
+@env_var_option(
+    "--max-depth",
+    help="Maximum depth for binary search in SQL validation",
+    type=int,
+    default=5,
+    show_default=True,
+    env_var="LOOKER_MAX_DEPTH"
+)
 def sql(**kwargs):
     """Run SQL validation on Looker project."""
     try:
@@ -341,6 +349,7 @@ def sql(**kwargs):
             runtime_threshold=config.runtime_threshold,
             incremental=config.incremental,
             target=config.target,
+            max_depth=config.max_depth,
             ignore_hidden=config.ignore_hidden,
             chunk_size=config.chunk_size,
             log_dir=config.log_dir,

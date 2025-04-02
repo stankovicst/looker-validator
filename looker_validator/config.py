@@ -89,6 +89,7 @@ class Config:
         self.severity = kwargs.get("severity") or os.environ.get("LOOKER_SEVERITY") or config_from_file.get("severity", "warning")
         self.fail_fast = kwargs.get("fail_fast") or (os.environ.get("LOOKER_FAIL_FAST", "").lower() == "true") or config_from_file.get("fail_fast", False)
         self.profile = kwargs.get("profile") or (os.environ.get("LOOKER_PROFILE", "").lower() == "true") or config_from_file.get("profile", False)
+        self.max_depth = int(kwargs.get("max_depth") or os.environ.get("LOOKER_MAX_DEPTH", "5") or config_from_file.get("max_depth", 5))
         self.runtime_threshold = int(kwargs.get("runtime_threshold") or os.environ.get("LOOKER_RUNTIME_THRESHOLD", "5") or config_from_file.get("runtime_threshold", 5))
         self.pin_imports = kwargs.get("pin_imports") or os.environ.get("LOOKER_PIN_IMPORTS") or config_from_file.get("pin_imports")
         self.ignore_hidden = kwargs.get("ignore_hidden") or (os.environ.get("LOOKER_IGNORE_HIDDEN", "").lower() == "true") or config_from_file.get("ignore_hidden", False)

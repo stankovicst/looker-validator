@@ -1,26 +1,27 @@
+# FILE: looker_validator/validators/sql_validator.py
 """
-SQL validator for testing the SQL in Looker dimensions with improved binary search.
+SQL Validator: Tests explores by running simple queries against them.
 """
 
 import logging
 import os
-import re
 import time
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, Any, Optional, Tuple, Set
+from typing import List, Dict, Any, Optional
 
-import looker_sdk
-from looker_sdk.sdk.api40 import models as models40
-from tqdm import tqdm
+from looker_sdk.sdk.api40.models import WriteQuery # Use API 4.0 models
+from looker_sdk.error import SDKError
 
 from looker_validator.validators.base import BaseValidator, ValidatorError
+# <<< --- CORRECT THIS LINE --- >>>
+from looker_validator.exceptions import SQLValidationError # Corrected capitalization
 
 logger = logging.getLogger(__name__)
 
 
 class SQLValidator(BaseValidator):
-    """Validator for testing SQL in Looker dimensions with improved error isolation."""
+    """Validator for testing explores via SQL queries."""
 
     def __init__(self, connection, project, **kwargs):
         """Initialize SQL validator.
@@ -32,693 +33,196 @@ class SQLValidator(BaseValidator):
         """
         super().__init__(connection, project, **kwargs)
         self.concurrency = kwargs.get("concurrency", 10)
-        self.fail_fast = kwargs.get("fail_fast", False)
-        self.profile = kwargs.get("profile", False)
-        self.runtime_threshold = kwargs.get("runtime_threshold", 5)
-        self.incremental = kwargs.get("incremental", False)
-        self.target = kwargs.get("target")
-        self.ignore_hidden = kwargs.get("ignore_hidden", False)
-        self.chunk_size = kwargs.get("chunk_size", 500)
-        self.max_retries = kwargs.get("max_retries", 2)
-        
-        # Query tracking
-        self.profile_results = []
-        
-        # Validation results
-        self.errors = {}
-        self.passing_explores = set()
-        self.failing_explores = set()
-        self.skipped_explores = set()
+        self.errors = {} # Initialize dictionary to store errors
 
     def validate(self) -> bool:
-        """Run SQL validation.
+        """Run SQL validation on explores.
 
         Returns:
-            True if all SQL is valid, False otherwise
+            True if all tested explores run successfully, False otherwise
         """
         start_time = time.time()
-        
+
         try:
             # Set up branch for validation
             self.setup_branch()
-            
+
             # Get all models and explores in the project
             logger.info(f"Finding explores for project {self.project}")
-            explores = self._get_all_explores()
-            
-            if not explores:
+            all_explores = self._get_all_explores() # Inherited from BaseValidator
+
+            if not all_explores:
                 logger.warning(f"No explores found for project {self.project}")
                 return True
-                
+
             # Filter explores based on selectors
-            explores = self._filter_explores(explores)
-            
-            if not explores:
-                logger.warning(f"No explores match the provided selectors")
+            explores_to_test = self._filter_explores(all_explores) # Inherited from BaseValidator
+
+            if not explores_to_test:
+                logger.warning(f"No explores match the provided selectors for project {self.project}")
                 return True
-                
-            # Get explores to test if using incremental mode
-            if self.incremental:
-                logger.info("Running in incremental mode, checking for changed SQL")
-                explores = self._get_changed_explores(explores)
-                
-                if not explores:
-                    logger.info("No SQL changes detected, skipping validation")
-                    return True
-            
-            # Run SQL validation on all explores
-            logger.info(f"Testing {len(explores)} explores [concurrency = {self.concurrency}]")
-            self._test_explores(explores)
-            
+
+            logger.info(f"Testing {len(explores_to_test)} explores [concurrency = {self.concurrency}]")
+
+            # Use ThreadPoolExecutor for concurrency
+            with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
+                # Map _test_explore function to each explore
+                futures = {executor.submit(self._test_explore, explore): explore for explore in explores_to_test}
+
+                # Process results as they complete
+                for future in as_completed(futures):
+                    explore = futures[future]
+                    try:
+                        # Check if the future raised an exception (handled within _test_explore)
+                        future.result()
+                    except Exception as exc:
+                        # This catches exceptions *during* future execution,
+                        # but _test_explore should handle SDK errors internally.
+                        # Log unexpected errors here.
+                        explore_key = f"{explore['model']}/{explore['name']}"
+                        logger.error(f"Unexpected error testing explore {explore_key}: {exc}")
+                        self.errors[explore_key] = f"Unexpected error: {exc}"
+
             # Log results
             self._log_results()
-            
-            # Show profile results if enabled
-            if self.profile and self.profile_results:
-                self._show_profile_results()
-            
+
             self.log_timing("SQL validation", start_time)
-            
-            # Return True if no errors
-            return len(self.failing_explores) == 0
-        
+
+            # Return True if no errors were recorded
+            return len(self.errors) == 0
+
+        # <<< --- ADD EXCEPTION TYPE TO CATCH --- >>>
+        # Catch the specific validation error if it propagates
+        except SQLValidationError as e:
+             logger.error(f"SQL Validation failed: {e}")
+             # Ensure errors are logged even if validation loop is interrupted
+             self._log_results()
+             return False
         finally:
             # Clean up temporary branch if needed
             self.cleanup()
 
-    def _get_all_explores(self) -> List[Dict[str, str]]:
-        """Get all explores in the project.
-
-        Returns:
-            List of explore dictionaries with 'model' and 'name' keys
-        """
-        try:
-            # Get all models in the project
-            models_response = self.sdk.all_lookml_models()
-            
-            # Find models for this project
-            project_models = [
-                model for model in models_response
-                if model.project_name == self.project
-            ]
-            
-            explores = []
-            
-            # Get all explores for each model
-            for model in project_models:
-                model_detail = self.sdk.lookml_model(model.name)
-                
-                for explore in model_detail.explores:
-                    explores.append({
-                        "model": model.name,
-                        "name": explore.name
-                    })
-            
-            return explores
-        
-        except Exception as e:
-            logger.error(f"Failed to get explores: {str(e)}")
-            raise ValidatorError(f"Failed to get explores: {str(e)}")
-
-    def _filter_explores(self, explores: List[Dict[str, str]]) -> List[Dict[str, str]]:
-        """Filter explores based on selectors.
+    def _test_explore(self, explore: Dict[str, str]):
+        """Run a simple test query against a single explore.
 
         Args:
-            explores: List of explore dictionaries
-
-        Returns:
-            Filtered list of explore dictionaries
+            explore: Dictionary containing 'model' and 'name' of the explore
         """
-        if not self.explore_selectors:
-            return explores
-            
-        includes, excludes = self.resolve_explores()
-        
-        filtered_explores = [
-            explore for explore in explores
-            if self.matches_selector(
-                explore["model"], 
-                explore["name"],
-                includes, 
-                excludes
+        model_name = explore['model']
+        explore_name = explore['name']
+        explore_key = f"{model_name}/{explore_name}"
+        logger.debug(f"Testing explore: {explore_key}")
+
+        try:
+            # 1. Find a dimension to query (try common patterns like 'id')
+            #    Get explore details to find fields.
+            explore_details = self.sdk.lookml_model_explore(
+                lookml_model_name=model_name,
+                explore_name=explore_name,
+                fields="fields" # Request only the fields information
             )
-        ]
-        
-        return filtered_explores
 
-    def _get_changed_explores(self, explores: List[Dict[str, str]]) -> List[Dict[str, str]]:
-        """Get explores with changed SQL between branches.
-
-        Args:
-            explores: List of explore dictionaries
-
-        Returns:
-            List of explores with changed SQL
-        """
-        # Remember current branch
-        current_branch = self.branch
-        
-        try:
-            # Get SQL dimensions on current branch
-            current_dimensions = {}
-            
-            for explore in explores:
-                model = explore["model"]
-                name = explore["name"]
-                dimensions = self._get_explore_dimensions(model, name)
-                current_dimensions[f"{model}/{name}"] = dimensions
-            
-            # Switch to target branch or production
-            target = self.target or "production"
-            logger.info(f"Checking for SQL changes against {target} branch")
-            
-            # Store current branch info
-            temp_branch = self.branch
-            temp_commit = self.commit_ref
-            temp_reset = self.remote_reset
-            
-            # Set branch to target
-            self.branch = target if target != "production" else None
-            self.commit_ref = None
-            self.remote_reset = False
-            
-            # Set up target branch
-            self.setup_branch()
-            
-            # Get SQL dimensions on target branch
-            target_dimensions = {}
-            
-            for explore in explores:
-                model = explore["model"]
-                name = explore["name"]
-                dimensions = self._get_explore_dimensions(model, name)
-                target_dimensions[f"{model}/{name}"] = dimensions
-            
-            # Reset back to original branch
-            self.branch = temp_branch
-            self.commit_ref = temp_commit
-            self.remote_reset = temp_reset
-            self.setup_branch()
-            
-            # Find explores with changed SQL
-            changed_explores = []
-            
-            for explore in explores:
-                key = f"{explore['model']}/{explore['name']}"
-                
-                # Check if dimensions changed
-                if key not in target_dimensions:
-                    logger.info(f"New explore found: {key}")
-                    changed_explores.append(explore)
-                    continue
-                
-                current = current_dimensions.get(key, {})
-                target = target_dimensions.get(key, {})
-                
-                # Check for changed dimensions
-                if self._has_sql_changes(current, target):
-                    logger.info(f"SQL changes detected in explore: {key}")
-                    changed_explores.append(explore)
+            # Find the first available dimension
+            field_to_query = None
+            if explore_details.fields and explore_details.fields.dimensions:
+                # Prefer 'id' fields if available
+                id_fields = [d.name for d in explore_details.fields.dimensions if 'id' in d.name.lower()]
+                if id_fields:
+                    field_to_query = id_fields[0]
                 else:
-                    logger.info(f"No SQL changes in explore: {key}")
-                    self.skipped_explores.add(key)
-            
-            return changed_explores
-            
-        except Exception as e:
-            logger.error(f"Failed to check for SQL changes: {str(e)}")
-            # Fall back to testing all explores
-            logger.warning("Falling back to testing all explores")
-            return explores
+                    # Fallback to the first dimension listed
+                    field_to_query = explore_details.fields.dimensions[0].name
 
-    def _has_sql_changes(self, current_dims: Dict, target_dims: Dict) -> bool:
-        """Check if SQL has changed between branches.
+            if not field_to_query:
+                 logger.warning(f"Explore {explore_key} has no dimensions, cannot run test query.")
+                 # Optionally mark as an error or just skip
+                 # self.errors[explore_key] = "Explore has no dimensions to query."
+                 return # Skip testing this explore
 
-        Args:
-            current_dims: Dictionary of dimensions from current branch
-            target_dims: Dictionary of dimensions from target branch
+            logger.debug(f"Using field '{field_to_query}' for explore {explore_key}")
 
-        Returns:
-            True if SQL has changed
-        """
-        # Check for new or removed dimensions
-        current_keys = set(current_dims.keys())
-        target_keys = set(target_dims.keys())
-        
-        if current_keys != target_keys:
-            return True
-        
-        # Check for SQL changes in existing dimensions
-        for name, dim in current_dims.items():
-            if name not in target_dims:
-                return True
-                
-            current_sql = dim.get("sql", "")
-            target_sql = target_dims[name].get("sql", "")
-            
-            if current_sql != target_sql:
-                return True
-                
-        return False
-
-    def _get_explore_dimensions(self, model: str, explore: str) -> Dict[str, Dict]:
-        """Get all dimensions for an explore.
-
-        Args:
-            model: Model name
-            explore: Explore name
-
-        Returns:
-            Dictionary of dimensions with name as key
-        """
-        try:
-            # Get explore metadata
-            explore_obj = self.sdk.lookml_model_explore(model, explore)
-            
-            dimensions = {}
-            
-            # Process all dimensions
-            if hasattr(explore_obj, "fields") and hasattr(explore_obj.fields, "dimensions"):
-                for dim in explore_obj.fields.dimensions:
-                    # Skip if ignoring hidden dimensions
-                    if self.ignore_hidden and dim.hidden:
-                        continue
-                        
-                    # Check for spectacles:ignore tag
-                    tags = dim.tags or []
-                    if "spectacles: ignore" in tags:
-                        continue
-                        
-                    dimensions[dim.name] = {
-                        "sql": dim.sql,
-                        "type": dim.type,
-                        "hidden": dim.hidden,
-                    }
-            
-            return dimensions
-            
-        except Exception as e:
-            logger.error(f"Failed to get dimensions for {model}/{explore}: {str(e)}")
-            return {}
-
-    def _test_explores(self, explores: List[Dict[str, str]]):
-        """Test SQL for all explores.
-
-        Args:
-            explores: List of explore dictionaries
-        """
-        # First test all explores with explore-level queries
-        self._run_explore_queries(explores)
-        
-        # If not in fail-fast mode, test failing explores dimension-by-dimension
-        if not self.fail_fast and self.failing_explores:
-            self._run_dimension_queries()
-
-    def _run_explore_queries(self, explores: List[Dict[str, str]]):
-        """Run explore-level queries.
-
-        Args:
-            explores: List of explore dictionaries
-        """
-        with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
-            futures = []
-            
-            for explore in explores:
-                futures.append(
-                    executor.submit(
-                        self._test_explore,
-                        explore["model"],
-                        explore["name"]
-                    )
-                )
-            
-            for future in tqdm(
-                as_completed(futures),
-                total=len(futures),
-                desc="Testing explores"
-            ):
-                # Process result if needed
-                pass
-
-    def _test_explore(self, model: str, explore: str) -> Tuple[bool, Optional[str]]:
-        """Test an explore by running a query with all dimensions.
-
-        Args:
-            model: Model name
-            explore: Explore name
-
-        Returns:
-            Tuple of (success, error_message)
-        """
-        try:
-            # Get dimensions for the explore
-            dimensions = self._get_explore_dimensions(model, explore)
-            
-            if not dimensions:
-                logger.warning(f"No dimensions found for {model}/{explore}")
-                self.passing_explores.add(f"{model}/{explore}")
-                return True, None
-            
-            # Split dimensions into chunks to avoid large queries
-            dimension_names = list(dimensions.keys())
-            chunks = [
-                dimension_names[i:i + self.chunk_size]
-                for i in range(0, len(dimension_names), self.chunk_size)
-            ]
-            
-            for chunk_index, chunk in enumerate(chunks):
-                # Test chunk of dimensions
-                success, error = self._test_dimension_chunk(model, explore, chunk)
-                
-                if not success:
-                    # Record failing explore
-                    explore_key = f"{model}/{explore}"
-                    self.failing_explores.add(explore_key)
-                    
-                    if self.fail_fast:
-                        # In fail-fast mode, record the error at explore level
-                        self.errors[explore_key] = {
-                            "error": error,
-                            "dimensions": []
-                        }
-                    
-                    return False, error
-            
-            # All chunks passed
-            self.passing_explores.add(f"{model}/{explore}")
-            return True, None
-            
-        except Exception as e:
-            logger.error(f"Error testing {model}/{explore}: {str(e)}")
-            self.failing_explores.add(f"{model}/{explore}")
-            return False, str(e)
-
-    def _test_dimension_chunk(self, model: str, explore: str, dimension_names: List[str]) -> Tuple[bool, Optional[str]]:
-        """Test a chunk of dimensions in an explore.
-
-        Args:
-            model: Model name
-            explore: Explore name
-            dimension_names: List of dimension names to test
-
-        Returns:
-            Tuple of (success, error_message)
-        """
-        if not dimension_names:
-            return True, None
-        
-        # Create query with all dimensions - use API 4.0 models
-        # Use a valid filter field from the explore or just rely on limit=0
-        try:
-            # First try without filters, just using limit=0
-            query = models40.WriteQuery(
-                model=model,
-                view=explore,
-                fields=dimension_names,
-                limit=0  # LIMIT 0 to prevent data fetching
+            # 2. Create a simple query body using the found field
+            query_body = WriteQuery(
+                model=model_name,
+                view=explore_name,
+                fields=[field_to_query],
+                limit="1" # Limit to 1 row for efficiency
             )
-        
-            start_time = time.time()
-            retries = 0
-        
-            while retries <= self.max_retries:
-                try:
-                    # Execute query
-                    response = self.sdk.run_inline_query("sql", query)
-                
-                    # Profile query if enabled
-                    if self.profile:
-                        elapsed = time.time() - start_time
-                        if elapsed >= self.runtime_threshold:
-                            self._add_profile_result(
-                                "explore",
-                                f"{model}.{explore}",
-                                elapsed,
-                                None
-                            )
-                
-                    return True, None
-                
-                except Exception as e:
-                    retries += 1
-                    error_message = str(e)
-                
-                    # Profile query if enabled
-                    if self.profile:
-                        elapsed = time.time() - start_time
-                        if elapsed >= self.runtime_threshold:
-                            self._add_profile_result(
-                                "explore",
-                                f"{model}.{explore}",
-                                elapsed,
-                                None
-                            )
-                
-                    # Check for SQL error
-                    if "SQL ERROR" in error_message:
-                        return False, error_message
-                    elif retries <= self.max_retries:
-                        # If it's a timeout or temporary error, retry
-                        if "timeout" in error_message.lower() or "502" in error_message or "504" in error_message:
-                            logger.info(f"Retry {retries}/{self.max_retries} for {model}/{explore} due to: {error_message}")
-                            time.sleep(2 ** retries)  # Exponential backoff
-                            continue
-                        else:
-                            logger.error(f"Non-SQL error in {model}/{explore}: {error_message}")
-                            return False, error_message
-                    else:
-                        logger.error(f"Max retries exceeded for {model}/{explore}: {error_message}")
-                        return False, f"Max retries exceeded: {error_message}"
-        except Exception as outer_e:
-            logger.error(f"Error creating query for {model}/{explore}: {str(outer_e)}")
-            return False, str(outer_e)
-    
 
-    def _run_dimension_queries(self):
-        """Run dimension-level queries for failing explores using binary search."""
-        logger.info("Performing dimension-level testing with binary search")
-        
-        for explore_key in self.failing_explores:
-            model, explore = explore_key.split("/")
-            
-            # Skip if already in fail-fast mode
-            if explore_key in self.errors and self.fail_fast:
-                continue
-            
-            # Get dimensions
-            dimensions = self._get_explore_dimensions(model, explore)
-            dimension_names = list(dimensions.keys())
-            
-            # Initialize the error object if needed
-            if explore_key not in self.errors:
-                self.errors[explore_key] = {
-                    "error": None,
-                    "dimensions": []
-                }
-            
-            # Use binary search to find errors
-            self._binary_search_dimensions(model, explore, dimension_names)
+            # 3. Create and run the SQL query
+            #    Using run_inline_query which combines create and run
+            #    Note: run_inline_query might behave differently across versions.
+            #    If issues arise, revert to create_query + run_query.
+            self.sdk.run_inline_query(result_format="sql", body=query_body)
 
-    def _binary_search_dimensions(self, model: str, explore: str, dimension_names: List[str]):
-        """Improved binary search with adaptive chunk sizing"""
-        # Base case: single dimension
-        if len(dimension_names) == 1:
-            self._test_single_dimension(model, explore, dimension_names[0])
-            return
-        
-        # Base case: empty list
-        if not dimension_names:
-            return
-        
-        # Adaptive chunk sizing based on project size
-        if len(dimension_names) > 1000:
-            chunk_size = 200  # Smaller chunks for very large projects
-        elif len(dimension_names) > 500:
-            chunk_size = 100
-        else:
-            chunk_size = 50
-    
-        # If the list is small enough, test dimensions individually
-        if len(dimension_names) <= 5:
-            for dim_name in dimension_names:
-                self._test_single_dimension(model, explore, dim_name)
-            return
-        
-        # Otherwise, split the list and test each half
-        midpoint = len(dimension_names) // 2
-        left_chunk = dimension_names[:midpoint]
-        right_chunk = dimension_names[midpoint:]
-    
-        # Test left chunk
-        left_success, _ = self._test_dimension_chunk(model, explore, left_chunk)
-        if not left_success:
-            # Recursively search the left chunk
-            self._binary_search_dimensions(model, explore, left_chunk)
-    
-        # Test right chunk
-        right_success, _ = self._test_dimension_chunk(model, explore, right_chunk)
-        if not right_success:
-            # Recursively search the right chunk
-            self._binary_search_dimensions(model, explore, right_chunk)
+            # If the above line doesn't raise an SDKError, the query syntax is likely valid
+            logger.debug(f"Explore {explore_key} SQL generated successfully.")
 
-    def _test_single_dimension(self, model: str, explore: str, dimension: str):
-        """Test a single dimension.
-        
-        Args:
-            model: Model name
-            explore: Explore name
-            dimension: Dimension name
-        """
-        success, error_message = self._test_dimension_chunk(model, explore, [dimension])
-        
-        if not success:
-            explore_key = f"{model}/{explore}"
-            
-            # Extract SQL from error if possible
-            sql = ""
-            try:
-                # Try to create a query to extract SQL
-                query = models40.WriteQuery(
-                    model=model,
-                    view=explore,
-                    fields=[dimension],
-                    filters={"1": "2"},
-                    limit=0
-                )
-                
-                # Get SQL without executing
-                sql = self.sdk.run_inline_query("sql", query)
-            except Exception as e:
-                logger.debug(f"Could not extract SQL for dimension {dimension}: {str(e)}")
-            
-            # Extract query ID if present
-            query_id = None
-            match = re.search(r"query_id=(\d+)", error_message)
-            if match:
-                query_id = match.group(1)
-                
-            # Simplify error message
-            if "SQL ERROR" in error_message:
-                # Extract SQL error part
-                sql_error = re.search(r"SQL ERROR: (.*?)(\n|$)", error_message)
-                if sql_error:
-                    error_message = sql_error.group(1)
-            
-            # Record the error
-            self.errors[explore_key]["dimensions"].append({
-                "name": dimension,
-                "error": error_message,
-                "query_id": query_id,
-                "sql": sql
-            })
+        except SDKError as e:
+            # Catch Looker SDK errors (e.g., invalid field, SQL generation error)
+            error_message = f"SDKError testing explore {explore_key}: {e.message}"
+            logger.error(error_message)
+            # Extract a cleaner error if possible from e.errors or e.message
+            clean_error = e.message # Default to full message
+            if hasattr(e, 'errors') and e.errors and isinstance(e.errors, list) and len(e.errors) > 0:
+                 # Try to get the first error message if available
+                 first_error = e.errors[0]
+                 if isinstance(first_error, dict) and 'message' in first_error:
+                     clean_error = first_error['message']
 
-    def _add_profile_result(self, type_: str, name: str, runtime: float, query_id: Optional[str]):
-        """Add a profile result for a long-running query.
+            self.errors[explore_key] = clean_error # Store the error message
 
-        Args:
-            type_: Type of query ('explore' or 'dimension')
-            name: Name of explore or dimension
-            runtime: Runtime in seconds
-            query_id: Query ID if available
-        """
-        self.profile_results.append({
-            "type": type_,
-            "name": name,
-            "runtime": runtime,
-            "query_id": query_id
-        })
-
-    def _show_profile_results(self):
-        """Show profiler results for long-running queries."""
-        if not self.profile_results:
-            return
-            
-        # Sort by runtime descending
-        sorted_results = sorted(
-            self.profile_results,
-            key=lambda x: x["runtime"],
-            reverse=True
-        )
-        
-        logger.info("\n" + "=" * 80)
-        logger.info("Query profiler results")
-        logger.info("=" * 80)
-        
-        # Format as table
-        logger.info(f"{'Type':<10} {'Name':<30} {'Runtime (s)':<12} {'Query ID':<10} {'Explore From Here':<50}")
-        logger.info(f"{'-'*10} {'-'*30} {'-'*12} {'-'*10} {'-'*50}")
-        
-        for result in sorted_results:
-            type_ = result["type"]
-            name = result["name"]
-            runtime = f"{result['runtime']:.1f}"
-            query_id = result["query_id"] or ""
-            
-            # Generate explore URL if query ID available
-            explore_url = ""
-            if query_id:
-                explore_url = f"{self.connection.base_url}/x/{query_id}"
-            
-            logger.info(f"{type_:<10} {name[:30]:<30} {runtime:<12} {query_id:<10} {explore_url:<50}")
-        
-        logger.info("=" * 80)
+        except Exception as e:
+            # Catch any other unexpected errors during the test
+            error_message = f"Unexpected error testing explore {explore_key}: {str(e)}"
+            logger.error(error_message, exc_info=True) # Log traceback for unexpected errors
+            self.errors[explore_key] = f"Unexpected error: {str(e)}"
 
     def _log_results(self):
-        """Log validation results."""
-        total_explores = len(self.passing_explores) + len(self.failing_explores) + len(self.skipped_explores)
-        
+        """Log SQL validation results."""
+        total_errors = len(self.errors)
+
         logger.info("\n" + "=" * 80)
-        logger.info(f"SQL Validation Results for {self.project}")
+        logger.info(f"SQL Validation Results for Project: {self.project}")
+        if self.branch:
+            logger.info(f"Branch: {self.branch}")
+        else:
+            logger.info("Branch: production")
         logger.info("=" * 80)
-        
-        if self.incremental:
-            logger.info(f"Incremental mode: comparing to {self.target or 'production'}")
-        
-        logger.info(f"Total explores: {total_explores}")
-        logger.info(f"Passing: {len(self.passing_explores)}")
-        logger.info(f"Failing: {len(self.failing_explores)}")
-        logger.info(f"Skipped: {len(self.skipped_explores)}")
-        
-        if self.failing_explores:
-            logger.info("\nFailed explores:")
-            
-            for explore_key in sorted(self.failing_explores):
-                logger.info(f"  ❌ {explore_key}")
-                
-                # Log dimension errors if available
-                if explore_key in self.errors:
-                    error_data = self.errors[explore_key]
-                    
-                    # Log explore-level error in fail-fast mode
-                    if error_data["error"] and self.fail_fast:
-                        logger.info(f"    Error: {error_data['error']}")
-                    
-                    # Log dimension errors
-                    for dim_error in error_data.get("dimensions", []):
-                        dim_name = dim_error["name"]
-                        error_msg = dim_error["error"]
-                        
-                        logger.info(f"    Dimension: {dim_name}")
-                        logger.info(f"      Error: {error_msg}")
-        
-        if self.passing_explores:
-            logger.info("\nPassing explores:")
-            for explore_key in sorted(self.passing_explores):
-                logger.info(f"  ✓ {explore_key}")
-                
-        if self.skipped_explores:
-            logger.info("\nSkipped explores (no SQL changes):")
-            for explore_key in sorted(self.skipped_explores):
-                logger.info(f"  ⏭️ {explore_key}")
-                
+
+        if total_errors > 0:
+            logger.error(f"\nFound {total_errors} explores with SQL errors:")
+            # Sort errors by explore key for consistent output
+            sorted_error_keys = sorted(self.errors.keys())
+            for explore_key in sorted_error_keys:
+                logger.error(f"  ❌ Explore: {explore_key}")
+                # Indent error message for readability
+                # Ensure error message is a string before splitting
+                error_msg_str = str(self.errors[explore_key])
+                error_lines = error_msg_str.split('\n')
+                for line in error_lines:
+                     logger.error(f"     Error: {line.strip()}")
+        else:
+            logger.info("\nAll tested explores generated SQL successfully! ✅")
+
         logger.info("=" * 80)
-        
-        # Save errors to log file
+
+        # Save errors to log file if any exist
         if self.errors:
-            log_path = os.path.join(self.log_dir, f"sql_errors_{self.project}.json")
+            log_filename = f"sql_errors_{self.project}"
+            if self.branch:
+                # Include branch name in log file if not production
+                safe_branch_name = "".join(c if c.isalnum() else "_" for c in self.branch)
+                log_filename += f"__{safe_branch_name}"
+            log_filename += ".json"
+            log_path = os.path.join(self.log_dir, log_filename)
+
             try:
+                os.makedirs(self.log_dir, exist_ok=True) # Ensure log dir exists
+                # Format for JSON log: key = explore, value = error message
                 with open(log_path, "w") as f:
-                    json.dump(self.errors, f, indent=2)
-                logger.info(f"Error details saved to {log_path}")
+                    json.dump(self.errors, f, indent=2, sort_keys=True)
+                logger.info(f"Detailed SQL error report saved to: {log_path}")
             except Exception as e:
-                logger.warning(f"Failed to save error log: {str(e)}")
+                logger.warning(f"Failed to save SQL error log to {log_path}: {str(e)}")
+

@@ -1,3 +1,4 @@
+# FILE: looker_validator/validators/base.py
 """
 Base validator class that all validator implementations extend.
 """
@@ -41,16 +42,16 @@ class BaseValidator(ABC):
         self.log_dir = kwargs.get("log_dir", "logs")
         self.pin_imports = kwargs.get("pin_imports")
         self.api_version = connection.api_version
-        
+
         # Explore selection
         self.explore_selectors = kwargs.get("explores", [])
-        
+
         # Working branch management
         self.temp_branch = None
-        
+
         # Create log directory if it doesn't exist
         os.makedirs(self.log_dir, exist_ok=True)
-        
+
         # Initialize cache directory
         self.cache_dir = os.path.join(self.log_dir, "cache")
         os.makedirs(self.cache_dir, exist_ok=True)
@@ -66,16 +67,16 @@ class BaseValidator(ABC):
 
     def setup_branch(self):
         """Set up the branch for validation.
-        
+
         This method handles branch checkout, commit checkout, or remote reset
         based on the provided options.
-        
+
         Returns:
             True if branch setup was successful
         """
         try:
             logger.info(f"Setting up branch for project {self.project}")
-            
+
             if self.commit_ref:
                 # Checkout specific commit
                 self.temp_branch = self.connection.checkout_commit(
@@ -91,7 +92,7 @@ class BaseValidator(ABC):
             else:
                 # Regular branch checkout (or production)
                 self.connection.switch_project_branch(self.project, self.branch)
-                
+
             return True
         except Exception as e:
             logger.error(f"Failed to set up branch: {str(e)}")
@@ -99,7 +100,7 @@ class BaseValidator(ABC):
 
     def cleanup(self):
         """Clean up after validation.
-        
+
         This method removes any temporary branches if they were created.
         """
         if self.temp_branch:
@@ -107,19 +108,87 @@ class BaseValidator(ABC):
             self.connection.cleanup_temp_branch(self.project, self.temp_branch)
             self.temp_branch = None
 
+    def _get_all_explores(self) -> List[Dict[str, str]]:
+        """Get all explores in the project.
+
+        Returns:
+            List of explore dictionaries with 'model' and 'name' keys
+        """
+        try:
+            # Get all models in the project
+            models_response = self.sdk.all_lookml_models()
+
+            # Find models for this project
+            project_models = [
+                model for model in models_response
+                if model.project_name == self.project
+            ]
+
+            explores = []
+
+            # Get all explores for each model
+            for model in project_models:
+                # Ensure model.name is a string before calling lookml_model
+                model_name = str(model.name)
+                try:
+                    model_detail = self.sdk.lookml_model(model_name)
+                    if model_detail.explores:
+                       for explore in model_detail.explores:
+                           explores.append({
+                               "model": model_name,
+                               "name": str(explore.name) # Ensure explore name is string
+                           })
+                except Exception as detail_e:
+                     logger.error(f"Failed to get details for model {model_name}: {str(detail_e)}")
+                     # Optionally, decide how to handle this - skip model or raise error
+
+            return explores
+
+        except Exception as e:
+            logger.error(f"Failed to get explores: {str(e)}")
+            raise ValidatorError(f"Failed to get explores: {str(e)}")
+
+    # <<< --- ADD THIS METHOD --- >>>
+    def _filter_explores(self, explores: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """Filter explores based on selectors.
+
+        Args:
+            explores: List of explore dictionaries
+
+        Returns:
+            Filtered list of explore dictionaries
+        """
+        if not self.explore_selectors:
+            return explores # Return all if no selectors are provided
+
+        includes, excludes = self.resolve_explores()
+
+        filtered_explores = [
+            explore for explore in explores
+            if self.matches_selector(
+                explore["model"],
+                explore["name"],
+                includes,
+                excludes
+            )
+        ]
+        logger.info(f"Filtered to {len(filtered_explores)} explores based on selectors.")
+        return filtered_explores
+    # <<< --- END OF ADDED METHOD --- >>>
+
     def resolve_explores(self) -> Tuple[List[str], List[str]]:
         """Resolve explore selectors to include/exclude lists.
-        
+
         Parses the explore selectors (like "model_a/*", "-model_b/explore_c")
         into separate include and exclude lists.
-        
+
         Returns:
-            Tuple of (includes, excludes) where each item is a list of 
+            Tuple of (includes, excludes) where each item is a list of
             "model_name/explore_name" strings
         """
         includes = []
         excludes = []
-        
+
         for selector in self.explore_selectors:
             if selector.startswith("-"):
                 # This is an exclude pattern
@@ -127,25 +196,25 @@ class BaseValidator(ABC):
             else:
                 # This is an include pattern
                 includes.append(selector)
-                
+
         return includes, excludes
 
-    def matches_selector(self, model_name: str, explore_name: str, 
+    def matches_selector(self, model_name: str, explore_name: str,
                         includes: List[str], excludes: List[str]) -> bool:
         """Check if a model/explore matches the include/exclude selectors.
-        
+
         Args:
             model_name: Name of the model
             explore_name: Name of the explore
             includes: List of include patterns
             excludes: List of exclude patterns
-            
+
         Returns:
             True if the model/explore should be included
         """
         # Format as "model_name/explore_name"
         full_name = f"{model_name}/{explore_name}"
-        
+
         # Check exclusions first (they take precedence)
         for exclude in excludes:
             # Handle wildcards
@@ -155,11 +224,11 @@ class BaseValidator(ABC):
                 return False
             elif exclude == full_name:
                 return False
-        
+
         # If no includes specified, include everything not excluded
         if not includes:
             return True
-            
+
         # Check inclusions
         for include in includes:
             # Handle wildcards
@@ -169,7 +238,7 @@ class BaseValidator(ABC):
                 return True
             elif include == full_name:
                 return True
-                
+
         # If we have includes but none matched, exclude this explore
         return False
 
@@ -177,7 +246,7 @@ class BaseValidator(ABC):
         """Pin imported projects to specific refs if specified."""
         if not self.pin_imports:
             return
-            
+
         try:
             # Parse pin_imports string (format: "project:ref,project2:ref2")
             pin_specs = self.pin_imports.split(",")
@@ -185,52 +254,61 @@ class BaseValidator(ABC):
                 if ":" not in pin_spec:
                     logger.warning(f"Invalid pin format: {pin_spec}, skipping")
                     continue
-                    
+
                 project_name, ref = pin_spec.strip().split(":", 1)
                 logger.info(f"Pinning imported project {project_name} to {ref}")
-                
+
                 # Use SDK to update the imported project ref
                 # Note: This assumes your Looker SDK version supports this
                 try:
-                    self.sdk.update_git_branch(project_name, ref)
+                    # This API call might need adjustment depending on the exact SDK method
+                    # for setting import refs. Assuming update_git_branch works for now.
+                    # Looker SDK might have a dedicated method like `update_project_dependency`.
+                    # For now, using update_git_branch as placeholder based on existing code.
+                    from looker_sdk.sdk.api40 import models as models40
+                    body = models40.WriteGitBranch(name=ref) # Assuming ref is a branch name
+                    # If ref is a commit SHA or tag, the API call might differ.
+                    self.sdk.update_git_branch(project_name, body=body)
+
                 except Exception as import_e:
-                    logger.warning(f"Failed to pin imported project {project_name}: {str(import_e)}")
+                    logger.warning(f"Failed to pin imported project {project_name} to ref '{ref}': {str(import_e)}")
         except Exception as e:
-            logger.warning(f"Failed to pin imported projects: {str(e)}")
+            logger.warning(f"Failed to parse or apply pin_imports: {str(e)}")
+
 
     def log_timing(self, name: str, start_time: float):
         """Log the execution time of an operation.
-        
+
         Args:
             name: Name of the operation
             start_time: Start time from time.time()
         """
         elapsed = time.time() - start_time
         logger.info(f"Completed {name} in {elapsed:.2f} seconds")
-    
+
     # === Cache system methods ===
-    
+
     def _setup_cache_dir(self):
         """Set up cache directory."""
         self.cache_dir = os.path.join(self.log_dir, "cache")
         os.makedirs(self.cache_dir, exist_ok=True)
-    
+
     def _generate_cache_key(self, model: str, explore: str) -> str:
         """Generate a cache key for explore validation.
-        
+
         Args:
             model: Model name
             explore: Explore name
-            
+
         Returns:
             MD5 hash string as cache key
         """
         key_string = f"{self.project}_{model}_{explore}"
         return hashlib.md5(key_string.encode()).hexdigest()
-    
+
     def _save_validation_cache(self, model: str, explore: str, result: Any):
         """Cache validation results by hash.
-        
+
         Args:
             model: Model name
             explore: Explore name
@@ -238,33 +316,33 @@ class BaseValidator(ABC):
         """
         if not hasattr(self, 'cache_dir'):
             self._setup_cache_dir()
-            
+
         cache_key = self._generate_cache_key(model, explore)
         cache_file = os.path.join(self.cache_dir, f"{cache_key}.json")
-        
+
         try:
             with open(cache_file, "w") as f:
                 json.dump(result, f)
             logger.debug(f"Cached results for {model}/{explore}")
         except Exception as e:
             logger.warning(f"Failed to cache results: {str(e)}")
-    
+
     def _check_validation_cache(self, model: str, explore: str) -> Optional[Any]:
         """Check for cached results.
-        
+
         Args:
             model: Model name
             explore: Explore name
-            
+
         Returns:
             Cached result data or None if not found
         """
         if not hasattr(self, 'cache_dir'):
             self._setup_cache_dir()
-            
+
         cache_key = self._generate_cache_key(model, explore)
         cache_file = os.path.join(self.cache_dir, f"{cache_key}.json")
-        
+
         if os.path.exists(cache_file):
             try:
                 with open(cache_file, "r") as f:
@@ -273,19 +351,19 @@ class BaseValidator(ABC):
                 return cache_data
             except Exception as e:
                 logger.warning(f"Failed to read cache: {str(e)}")
-                
+
         return None
-    
+
     def _clear_cache(self, model: Optional[str] = None, explore: Optional[str] = None):
         """Clear cache for specific model/explore or all caches.
-        
+
         Args:
             model: Model name (None for all models)
             explore: Explore name (None for all explores)
         """
         if not hasattr(self, 'cache_dir'):
             self._setup_cache_dir()
-            
+
         if not model and not explore:
             # Clear all caches
             for cache_file in os.listdir(self.cache_dir):
@@ -296,11 +374,11 @@ class BaseValidator(ABC):
             # Clear specific cache
             cache_key = self._generate_cache_key(model or "", explore or "")
             cache_file = os.path.join(self.cache_dir, f"{cache_key}.json")
-            
+
             if os.path.exists(cache_file):
                 os.remove(cache_file)
                 logger.debug(f"Cleared cache for {model}/{explore}")
-    
+
     def _cleanup_between_tests(self):
         """Force garbage collection between major operations."""
         import gc
