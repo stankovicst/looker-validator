@@ -1,12 +1,13 @@
 """
-Command-line interface for Looker Validator with enhanced environment variable support.
+Command-line interface for Looker Validator.
 """
 
 import os
 import sys
 import logging
+import yaml
 import click
-from typing import List, Optional, Any, Callable
+from typing import List, Optional, Any, Dict
 
 from looker_validator.config import Config
 from looker_validator.connection import LookerConnection
@@ -23,91 +24,55 @@ logging.basicConfig(
 logger = logging.getLogger("looker_validator")
 
 
-# Enhanced Click Option classes for environment variables
-class EnvVarOption(click.Option):
-    """Click option that can be set from an environment variable.
-    
-    The option prioritizes: CLI argument > Environment Variable > Default
-    """
+class ConfigFileOption(click.Option):
+    """Click option that loads values from a YAML config file."""
     
     def __init__(self, *args, **kwargs):
-        # Extract env_var from kwargs
-        self.env_var = kwargs.pop('env_var', None)
+        self.config_file_param = kwargs.pop('config_file_param', 'config_file')
+        super().__init__(*args, **kwargs)
         
-        # Get the default value from environment if available
-        if self.env_var and self.env_var in os.environ:
-            kwargs['default'] = os.environ[self.env_var]
+    def handle_parse_result(self, ctx, opts, args):
+        # Check if the config file parameter is provided
+        config_file = opts.get(self.config_file_param)
+        if config_file:
+            # Load the config file
+            with open(config_file, 'r') as f:
+                config = yaml.safe_load(f)
             
-        # If a default exists and the option is required, make it not required
-        if kwargs.get('default') is not None and kwargs.get('required'):
+            # Update options with config file values if not already set
+            for key, value in config.items():
+                if key not in opts or opts[key] is None:
+                    opts[key] = value
+        
+        return super().handle_parse_result(ctx, opts, args)
+
+
+def env_var_option(*param_decls, **kwargs):
+    """Decorator for options that support environment variables."""
+    env_var = kwargs.pop('env_var', None)
+    
+    if env_var and env_var in os.environ:
+        kwargs['default'] = os.environ[env_var]
+        if kwargs.get('required'):
             kwargs['required'] = False
-            
-        super().__init__(*args, **kwargs)
-        
-    def get_help_record(self, ctx):
-        """Add environment variable info to help text."""
-        help_text = super().get_help_record(ctx)
-        
-        if help_text and self.env_var:
-            help_text = (
-                help_text[0], 
-                f"{help_text[1]} [env: {self.env_var}]"
-            )
-            
-        return help_text
-
-
-class EnvVarFlag(click.Option):
-    """Click boolean flag that can be set from an environment variable."""
     
-    def __init__(self, *args, **kwargs):
-        # Extract env_var from kwargs
-        self.env_var = kwargs.pop('env_var', None)
-        
-        # Set is_flag to True to make it a boolean flag
-        kwargs['is_flag'] = True
-        
-        # If env var is set, use its value
-        if self.env_var and self.env_var in os.environ:
-            env_value = os.environ[self.env_var].lower()
-            if env_value in ('true', '1', 'yes'):
-                kwargs['default'] = True
-            elif env_value in ('false', '0', 'no'):
-                kwargs['default'] = False
-        
-        super().__init__(*args, **kwargs)
-        
-    def get_help_record(self, ctx):
-        """Add environment variable info to help text."""
-        help_text = super().get_help_record(ctx)
-        
-        if help_text and self.env_var:
-            help_text = (
-                help_text[0], 
-                f"{help_text[1]} [env: {self.env_var}]"
-            )
-            
-        return help_text
+    # Add env var to help text
+    if env_var:
+        help_text = kwargs.get('help', '')
+        kwargs['help'] = f"{help_text} [env: {env_var}]"
+    
+    # Make it work with config files too
+    kwargs['cls'] = ConfigFileOption
+    
+    return click.option(*param_decls, **kwargs)
 
 
-def env_var_option(*param_decls, **attrs):
-    """Decorator to create a click option that supports environment variables."""
-    return click.option(*param_decls, cls=EnvVarOption, **attrs)
-
-
-def env_var_flag(*param_decls, **attrs):
-    """Decorator to create a click flag that supports environment variables."""
-    return click.option(*param_decls, cls=EnvVarFlag, **attrs)
-
-
-# Shared command options with environment variable support
-def common_options(f: Callable) -> Callable:
-    """Common options for all commands with environment variable support."""
-    f = env_var_option(
+def common_options(f):
+    """Common options for all commands."""
+    f = click.option(
         "--config-file", "-c",
         help="Path to YAML config file",
-        type=click.Path(exists=True, dir_okay=False),
-        env_var="LOOKER_CONFIG_FILE"
+        type=click.Path(exists=True, dir_okay=False)
     )(f)
     f = env_var_option(
         "--base-url",
@@ -156,9 +121,10 @@ def common_options(f: Callable) -> Callable:
         help="Git commit reference",
         env_var="LOOKER_COMMIT_REF"
     )(f)
-    f = env_var_flag(
+    f = env_var_option(
         "--remote-reset",
         help="Reset branch to remote state",
+        is_flag=True,
         env_var="LOOKER_REMOTE_RESET"
     )(f)
     f = env_var_option(
@@ -168,9 +134,10 @@ def common_options(f: Callable) -> Callable:
         show_default=True,
         env_var="LOOKER_LOG_DIR"
     )(f)
-    f = env_var_flag(
+    f = env_var_option(
         "--verbose", "-v",
         help="Enable verbose logging",
+        is_flag=True,
         env_var="LOOKER_VERBOSE"
     )(f)
     f = env_var_option(
@@ -191,18 +158,16 @@ def common_options(f: Callable) -> Callable:
 
 # Create the CLI group
 @click.group()
-@click.version_option(message="Looker Validator v%(version)s")
 def cli():
     """Looker Validator - A continuous integration tool for Looker and LookML."""
     pass
 
 
 @cli.command()
-@env_var_option(
+@click.option(
     "--config-file", "-c",
     help="Path to YAML config file",
-    type=click.Path(exists=True, dir_okay=False),
-    env_var="LOOKER_CONFIG_FILE"
+    type=click.Path(exists=True, dir_okay=False)
 )
 @env_var_option(
     "--base-url",
@@ -235,6 +200,11 @@ def cli():
     show_default=True,
     env_var="LOOKER_API_VERSION"
 )
+@env_var_option(
+    "--project",
+    help="Looker project name",
+    env_var="LOOKER_PROJECT"
+)  # Note: Not required for connect
 @env_var_option(
     "--timeout",
     help="API request timeout in seconds",
@@ -292,14 +262,16 @@ def connect(**kwargs):
     show_default=True,
     env_var="LOOKER_CONCURRENCY"
 )
-@env_var_flag(
+@env_var_option(
     "--fail-fast",
     help="Only run explore-level queries",
+    is_flag=True,
     env_var="LOOKER_FAIL_FAST"
 )
-@env_var_flag(
+@env_var_option(
     "--profile", "-p",
     help="Profile query execution time",
+    is_flag=True,
     env_var="LOOKER_PROFILE"
 )
 @env_var_option(
@@ -310,9 +282,10 @@ def connect(**kwargs):
     show_default=True,
     env_var="LOOKER_RUNTIME_THRESHOLD"
 )
-@env_var_flag(
+@env_var_option(
     "--incremental",
     help="Only show errors unique to the branch",
+    is_flag=True,
     env_var="LOOKER_INCREMENTAL"
 )
 @env_var_option(
@@ -320,9 +293,10 @@ def connect(**kwargs):
     help="Target branch for incremental comparison (default: production)",
     env_var="LOOKER_TARGET"
 )
-@env_var_flag(
+@env_var_option(
     "--ignore-hidden",
     help="Ignore hidden dimensions",
+    is_flag=True,
     env_var="LOOKER_IGNORE_HIDDEN"
 )
 @env_var_option(
@@ -401,14 +375,16 @@ def sql(**kwargs):
     multiple=True,
     env_var="LOOKER_FOLDERS"
 )
-@env_var_flag(
+@env_var_option(
     "--exclude-personal",
     help="Exclude content in personal folders",
+    is_flag=True,
     env_var="LOOKER_EXCLUDE_PERSONAL"
 )
-@env_var_flag(
+@env_var_option(
     "--incremental",
     help="Only show errors unique to the branch",
+    is_flag=True,
     env_var="LOOKER_INCREMENTAL"
 )
 @env_var_option(
@@ -474,14 +450,6 @@ def content(**kwargs):
     multiple=True,
     env_var="LOOKER_EXPLORES"
 )
-@env_var_option(
-    "--concurrency",
-    help="Number of concurrent test executions",
-    type=int,
-    default=15,
-    show_default=True,
-    env_var="LOOKER_CONCURRENCY"
-)
 def assert_command(**kwargs):
     """Run LookML data tests on Looker project."""
     try:
@@ -512,7 +480,6 @@ def assert_command(**kwargs):
             explores=config.explores,
             log_dir=config.log_dir,
             pin_imports=config.pin_imports,
-            concurrency=kwargs.get("concurrency", 15)
         )
         
         success = validator.validate()
@@ -538,14 +505,6 @@ def assert_command(**kwargs):
     default="warning",
     show_default=True,
     env_var="LOOKER_SEVERITY"
-)
-@env_var_option(
-    "--timeout",
-    help="Request timeout in seconds (handled by connection settings)",
-    type=int,
-    default=7200,  # 2 hour default for large projects
-    show_default=True,
-    env_var="LOOKER_LOOKML_TIMEOUT"
 )
 def lookml(**kwargs):
     """Run LookML validation on Looker project."""

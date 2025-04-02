@@ -514,39 +514,41 @@ class SQLValidator(BaseValidator):
             self._binary_search_dimensions(model, explore, dimension_names)
 
     def _binary_search_dimensions(self, model: str, explore: str, dimension_names: List[str]):
-        """Use binary search to identify problematic dimensions.
-        
-        Args:
-            model: Model name
-            explore: Explore name
-            dimension_names: List of dimension names to test
-        """
+        """Improved binary search with adaptive chunk sizing"""
         # Base case: single dimension
         if len(dimension_names) == 1:
             self._test_single_dimension(model, explore, dimension_names[0])
             return
-            
+        
         # Base case: empty list
         if not dimension_names:
             return
-            
+        
+        # Adaptive chunk sizing based on project size
+        if len(dimension_names) > 1000:
+            chunk_size = 200  # Smaller chunks for very large projects
+        elif len(dimension_names) > 500:
+            chunk_size = 100
+        else:
+            chunk_size = 50
+    
         # If the list is small enough, test dimensions individually
         if len(dimension_names) <= 5:
             for dim_name in dimension_names:
                 self._test_single_dimension(model, explore, dim_name)
             return
-            
+        
         # Otherwise, split the list and test each half
         midpoint = len(dimension_names) // 2
         left_chunk = dimension_names[:midpoint]
         right_chunk = dimension_names[midpoint:]
-        
+    
         # Test left chunk
         left_success, _ = self._test_dimension_chunk(model, explore, left_chunk)
         if not left_success:
             # Recursively search the left chunk
             self._binary_search_dimensions(model, explore, left_chunk)
-        
+    
         # Test right chunk
         right_success, _ = self._test_dimension_chunk(model, explore, right_chunk)
         if not right_success:
