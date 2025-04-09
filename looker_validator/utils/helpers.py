@@ -1,156 +1,32 @@
+# looker_validator/utils/helpers.py
 """
 Helper utilities for Looker Validator.
+Simplified version: Removed functions made redundant by BaseValidator or printer.
+Improved error handling for file operations.
 """
 
 import os
 import re
 import json
 import time
+import logging
 from typing import Dict, List, Any, Optional, Tuple, Set, Union
+from pathlib import Path # Use pathlib for path operations
 
+logger = logging.getLogger(__name__)
 
-def format_time(seconds: float) -> str:
-    """Format time duration in a human-readable format.
-
-    Args:
-        seconds: Time in seconds
-
-    Returns:
-        Formatted time string
-    """
-    if seconds < 60:
-        return f"{seconds:.1f} seconds"
-    elif seconds < 3600:
-        minutes = seconds / 60
-        return f"{minutes:.1f} minutes"
-    else:
-        hours = seconds / 3600
-        minutes = (seconds % 3600) / 60
-        return f"{int(hours)} hours {int(minutes)} minutes"
-
-
-def parse_explore_selector(selector: str) -> Tuple[str, str, bool]:
-    """Parse a model/explore selector string.
-
-    Args:
-        selector: Model/explore selector (e.g., "model/explore" or "-model/explore")
-
-    Returns:
-        Tuple of (model, explore, is_exclude)
-    """
-    is_exclude = selector.startswith("-")
-    if is_exclude:
-        selector = selector[1:]
-    
-    parts = selector.split("/", 1)
-    
-    if len(parts) == 1:
-        return parts[0], "*", is_exclude
-    else:
-        return parts[0], parts[1], is_exclude
-
-
-def format_error_message(message: str, max_length: int = 100) -> str:
-    """Format an error message for display.
-
-    Args:
-        message: Error message
-        max_length: Maximum length for the formatted message
-
-    Returns:
-        Formatted error message
-    """
-    # Strip whitespace and newlines
-    message = " ".join(message.split())
-    
-    # Truncate if too long
-    if len(message) > max_length:
-        return message[:max_length] + "..."
-    
-    return message
-
-
-def check_spectacles_ignore(sql: str, tags: List[str]) -> bool:
-    """Check if a dimension should be ignored by Spectacles.
-
-    Args:
-        sql: SQL string for the dimension
-        tags: List of tags for the dimension
-
-    Returns:
-        True if the dimension should be ignored
-    """
-    # Check for spectacles: ignore tag
-    if any("spectacles: ignore" in tag.lower() for tag in tags):
-        return True
-    
-    # Check for -- spectacles: ignore comment in SQL
-    if sql and re.search(r'--\s*spectacles:\s*ignore', sql, re.IGNORECASE):
-        return True
-    
-    return False
-
-
-def save_json_file(data: Any, file_path: str, indent: int = 2) -> bool:
-    """Save data to a JSON file.
-
-    Args:
-        data: Data to save
-        file_path: Path to save the file
-        indent: Indentation level for JSON formatting
-
-    Returns:
-        True if saved successfully
-    """
-    try:
-        # Create directory if it doesn't exist
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        
-        # Save to file
-        with open(file_path, 'w') as f:
-            json.dump(data, f, indent=indent)
-        
-        return True
-    except Exception as e:
-        print(f"Failed to save JSON file: {str(e)}")
-        return False
-
-
-def load_json_file(file_path: str, default: Any = None) -> Any:
-    """Load data from a JSON file.
-
-    Args:
-        file_path: Path to the JSON file
-        default: Default value if file doesn't exist or can't be loaded
-
-    Returns:
-        Loaded data or default value
-    """
-    try:
-        if not os.path.exists(file_path):
-            return default
-        
-        with open(file_path, 'r') as f:
-            return json.load(f)
-    except Exception as e:
-        print(f"Failed to load JSON file: {str(e)}")
-        return default
-
+# --- Potentially Useful Helper Functions ---
 
 def format_duration_for_display(seconds: float) -> str:
-    """Format a duration for user display.
-
-    Args:
-        seconds: Duration in seconds
-
-    Returns:
-        Formatted duration string
-    """
+    """Format a duration (< 0.1s -> ms, < 60s -> s, < 3600s -> Xm Ys, >= 3600s -> Xh Ym)."""
     if seconds < 0.1:
+        # Show 0 decimal places for < 100ms
         return f"{seconds * 1000:.0f}ms"
     elif seconds < 1:
+        # Show 0 decimal places for >= 100ms and < 1s
         return f"{seconds * 1000:.0f}ms"
     elif seconds < 60:
+        # Show 1 decimal place for seconds
         return f"{seconds:.1f}s"
     elif seconds < 3600:
         minutes = int(seconds // 60)
@@ -161,123 +37,157 @@ def format_duration_for_display(seconds: float) -> str:
         minutes = int((seconds % 3600) // 60)
         return f"{hours}h {minutes}m"
 
+def check_spectacles_ignore(sql: Optional[str], tags: Optional[List[str]]) -> bool:
+    """Check if a dimension/measure has Spectacles ignore comment/tag.
+
+    Args:
+        sql: SQL string for the dimension/measure.
+        tags: List of LookML tags for the dimension/measure.
+
+    Returns:
+        True if the field should be ignored based on Spectacles convention.
+    """
+    # Check for spectacles: ignore tag (case-insensitive)
+    if tags and any("spectacles: ignore" in tag.lower() for tag in tags):
+        logger.debug("Field ignored due to 'spectacles: ignore' tag.")
+        return True
+
+    # Check for -- spectacles: ignore comment in SQL (case-insensitive)
+    if sql and re.search(r'--\s*spectacles:\s*ignore', sql, re.IGNORECASE):
+        logger.debug("Field ignored due to '-- spectacles: ignore' comment.")
+        return True
+
+    return False
+
+def save_json_file(data: Any, file_path: Union[str, Path], indent: int = 2) -> bool:
+    """Save data to a JSON file with improved error handling and logging.
+
+    Args:
+        data: Data structure to save (must be JSON serializable).
+        file_path: Path object or string path to save the file.
+        indent: Indentation level for JSON formatting.
+
+    Returns:
+        True if saved successfully, False otherwise.
+    """
+    try:
+        path = Path(file_path).resolve() # Resolve to absolute path for clarity
+        # Create directory if it doesn't exist
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Save to file with utf-8 encoding
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=indent, ensure_ascii=False, sort_keys=True) # Add sort_keys
+        logger.info(f"Successfully saved JSON data to: {path}")
+        return True
+    except (IOError, OSError) as e:
+        logger.error(f"I/O error saving JSON file to '{file_path}': {e}", exc_info=True)
+        return False
+    except (TypeError, ValueError) as e: # Catches JSON serialization errors
+        logger.error(f"Data serialization error saving JSON file to '{file_path}': {e}", exc_info=True)
+        return False
+    except Exception as e: # Catch other potential errors
+        logger.error(f"Unexpected error saving JSON file to '{file_path}': {e}", exc_info=True)
+        return False
+
+
+def load_json_file(file_path: Union[str, Path], default: Any = None) -> Any:
+    """Load data from a JSON file with improved error handling and logging.
+
+    Args:
+        file_path: Path object or string path to the JSON file.
+        default: Default value if file doesn't exist or can't be loaded/parsed.
+
+    Returns:
+        Loaded data or default value.
+    """
+    try:
+        path = Path(file_path).resolve()
+        if not path.is_file():
+            logger.debug(f"JSON file not found: {path}, returning default.")
+            return default
+
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        logger.debug(f"Successfully loaded JSON data from: {path}")
+        return data
+    except (IOError, OSError) as e:
+        logger.warning(f"I/O error loading JSON file '{file_path}': {e}. Returning default.")
+        return default
+    except json.JSONDecodeError as e:
+        logger.warning(f"JSON decode error in file '{file_path}': {e}. Returning default.")
+        return default
+    except Exception as e: # Catch other potential errors
+        logger.warning(f"Unexpected error loading JSON file '{file_path}': {e}. Returning default.", exc_info=True)
+        return default
+
 
 def create_explore_url(base_url: str, model: str, explore: str) -> str:
-    """Create a URL to an explore in Looker.
-
-    Args:
-        base_url: Looker instance URL
-        model: Model name
-        explore: Explore name
-
-    Returns:
-        URL to the explore
-    """
+    """Create a URL to an explore page in the Looker UI."""
+    if not base_url: # Handle case where base_url might be None/empty
+        return "#"
     # Ensure base_url doesn't end with a slash
-    if base_url.endswith('/'):
-        base_url = base_url[:-1]
-    
-    return f"{base_url}/explore/{model}/{explore}"
+    clean_base_url = base_url.rstrip('/')
+    # Basic URL structure
+    return f"{clean_base_url}/explore/{model}/{explore}"
 
 
-def is_model_excluded(model: str, includes: List[str], excludes: List[str]) -> bool:
-    """Check if a model is excluded based on include/exclude lists.
-
-    Args:
-        model: Model name
-        includes: List of include patterns
-        excludes: List of exclude patterns
-
-    Returns:
-        True if the model should be excluded
-    """
-    # Check exclude patterns first
-    for exclude in excludes:
-        if exclude == model or exclude == f"{model}/*":
-            return True
-    
-    # If includes are specified but model isn't included, exclude it
-    if includes:
-        for include in includes:
-            if include == model or include == f"{model}/*" or include == "*":
-                return False
-        return True
-    
-    # Default: not excluded
-    return False
+def extract_filename_from_path(file_path: Optional[str]) -> str:
+    """Extract the filename from a file path using pathlib, handling potential errors."""
+    if not file_path:
+        return "Unknown file"
+    try:
+        # Use pathlib for robust path handling
+        return Path(file_path).name
+    except Exception as e: # Catch potential errors with invalid path formats
+        logger.warning(f"Could not extract filename from path '{file_path}': {e}")
+        return "Invalid path"
 
 
-def is_explore_excluded(model: str, explore: str, includes: List[str], excludes: List[str]) -> bool:
-    """Check if an explore is excluded based on include/exclude lists.
+def extract_looker_error(error_message: Optional[str]) -> str:
+    """Attempt to extract a more concise error message from common Looker API error patterns."""
+    if not error_message:
+        return "Unknown error"
 
-    Args:
-        model: Model name
-        explore: Explore name
-        includes: List of include patterns
-        excludes: List of exclude patterns
+    # Try common patterns (add more as needed)
+    # Added LookML pattern, DB patterns
+    patterns = [
+        r"SQL ERROR:\s*(.*?)(?:\\n|\n|$)", # SQL Error
+        r"Syntax error:\s*(.*?)(?:\\n|\n|$)", # Syntax Error
+        r"Invalid field reference\s*`(.*?)`", # Invalid field
+        r"Unknown parameter\s*'(.*?)'", # Unknown LookML parameter
+        r"Unknown view\s*\"(.*?)\"", # Unknown view
+        r"Unknown model\s*\"(.*?)\"", # Unknown model
+        r"Could not find relation\s*\"(.*?)\"", # Database relation not found
+        r"Permission denied for relation\s*\"(.*?)\"", # DB Permission denied
+        r"Invalid argument\(s\):\s*(.*?)(?:\\n|\n|$)", # Generic invalid argument
+        r"Element \w+ is not allowed", # LookML structure error
+    ]
 
-    Returns:
-        True if the explore should be excluded
-    """
-    # Check if model is excluded
-    if is_model_excluded(model, includes, excludes):
-        return True
-    
-    # Check exclude patterns for the explore
-    for exclude in excludes:
-        if exclude == f"{model}/{explore}" or exclude == f"*/{explore}":
-            return True
-    
-    # If includes are specified and explore isn't included, exclude it
-    if includes:
-        is_included = False
-        for include in includes:
-            if (include == f"{model}/{explore}" or 
-                include == f"{model}/*" or 
-                include == f"*/{explore}" or
-                include == "*/*"):
-                is_included = True
-                break
-        
-        if not is_included:
-            return True
-    
-    # Default: not excluded
-    return False
-
-
-def extract_filename_from_path(file_path: str) -> str:
-    """Extract the filename from a file path.
-
-    Args:
-        file_path: File path
-
-    Returns:
-        Filename
-    """
-    return os.path.basename(file_path) if file_path else "Unknown file"
-
-
-def extract_looker_error(error_message: str) -> str:
-    """Extract the relevant part of a Looker error message.
-
-    Args:
-        error_message: Full error message from Looker
-
-    Returns:
-        Simplified error message
-    """
-    # Extract SQL error
-    if "SQL ERROR" in error_message:
-        match = re.search(r"SQL ERROR: (.*?)(\n|$)", error_message)
+    for pattern in patterns:
+        match = re.search(pattern, error_message, re.IGNORECASE | re.DOTALL)
         if match:
-            return match.group(1)
-    
-    # Extract syntax error
-    if "Syntax error" in error_message:
-        match = re.search(r"Syntax error: (.*?)(\n|$)", error_message)
-        if match:
-            return match.group(1)
-    
-    # Default: return the original message with whitespace cleaned up
-    return " ".join(error_message.split())
+            extracted = match.group(1).strip().strip("'\"`")
+            # Add context based on pattern if helpful
+            if "SQL ERROR" in error_message: return f"SQL Error: {extracted}"
+            if "Syntax error" in error_message: return f"Syntax Error: {extracted}"
+            # Add more context prefixes if desired
+            return extracted # Return the core message part
+
+    # If no specific pattern matches, return the first non-empty line or a truncated version
+    lines = [line.strip() for line in error_message.splitlines() if line.strip()]
+    first_line = lines[0] if lines else error_message # Fallback to original if split fails
+
+    max_len = 150
+    if len(first_line) > max_len:
+        return first_line[:max_len] + "..."
+    else:
+        return first_line
+
+# --- Functions Removed (Redundant/Replaced) ---
+# - format_time (use format_duration_for_display)
+# - parse_explore_selector (handled by BaseValidator.resolve_explores)
+# - format_error_message (handled by rich text wrapping/overflow in printer)
+# - is_model_excluded (handled by BaseValidator.matches_selector)
+# - is_explore_excluded (handled by BaseValidator.matches_selector)
+

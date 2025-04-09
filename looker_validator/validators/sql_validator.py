@@ -1,228 +1,194 @@
-# FILE: looker_validator/validators/sql_validator.py
 """
 SQL Validator: Tests explores by running simple queries against them.
+Based on user's original code, updated for new BaseValidator and error handling.
+Fixed ImportError for LookerValidationError.
 """
 
 import logging
-import os
 import time
-import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional
 
-from looker_sdk.sdk.api40.models import WriteQuery # Use API 4.0 models
+from looker_sdk.sdk.api40 import models as models40 # Use API 4.0 models
 from looker_sdk.error import SDKError
 
-from looker_validator.validators.base import BaseValidator, ValidatorError
-# <<< --- CORRECT THIS LINE --- >>>
-from looker_validator.exceptions import SQLValidationError # Corrected capitalization
+# FIXED: Add the correct import for BaseValidator
+from .base import BaseValidator
+# Use central exceptions
+from ..exceptions import LookerApiError, SQLValidationError, ValidatorError
 
 logger = logging.getLogger(__name__)
 
 
 class SQLValidator(BaseValidator):
-    """Validator for testing explores via SQL queries."""
+    """
+    Validator for testing explores by running simple, limited queries via Looker API.
+    Checks if Looker can successfully generate SQL for explores.
+    """
 
     def __init__(self, connection, project, **kwargs):
-        """Initialize SQL validator.
-
-        Args:
-            connection: LookerConnection instance
-            project: Looker project name
-            **kwargs: Additional validator options
-        """
+        """Initialize SQL validator."""
         super().__init__(connection, project, **kwargs)
-        self.concurrency = kwargs.get("concurrency", 10)
-        self.errors = {} # Initialize dictionary to store errors
+        try:
+            concurrency_default = 10
+            self.concurrency = max(1, int(kwargs.get("concurrency", concurrency_default)))
+        except (ValueError, TypeError):
+            logger.warning(f"Invalid concurrency value, defaulting to {concurrency_default}.")
+            self.concurrency = concurrency_default
 
-    def validate(self) -> bool:
-        """Run SQL validation on explores.
-
-        Returns:
-            True if all tested explores run successfully, False otherwise
-        """
+    def _execute_validation(self) -> List[Dict[str, Any]]:
+        """Core SQL validation logic, called by BaseValidator.validate()."""
+        all_errors: List[Dict[str, Any]] = []
         start_time = time.time()
 
+        # Get and filter explores *within* the execution phase, after branch setup
         try:
-            # Set up branch for validation
-            self.setup_branch()
-
-            # Get all models and explores in the project
-            logger.info(f"Finding explores for project {self.project}")
-            all_explores = self._get_all_explores() # Inherited from BaseValidator
-
+            all_explores = self._get_all_explores()
             if not all_explores:
-                logger.warning(f"No explores found for project {self.project}")
-                return True
+                logger.warning(f"No explores found for project '{self.project}', skipping SQL validation.")
+                return []
 
-            # Filter explores based on selectors
-            explores_to_test = self._filter_explores(all_explores) # Inherited from BaseValidator
-
+            explores_to_test = self._filter_explores(all_explores)
             if not explores_to_test:
-                logger.warning(f"No explores match the provided selectors for project {self.project}")
-                return True
+                logger.warning(f"No explores match the provided selectors for project '{self.project}', skipping SQL validation.")
+                return []
 
-            logger.info(f"Testing {len(explores_to_test)} explores [concurrency = {self.concurrency}]")
+        except (LookerApiError, ValidatorError) as e:
+             logger.error(f"Failed to get or filter explores for SQL validation: {e}", exc_info=True)
+             return [{
+                 "validator": self.__class__.__name__, "type": "Setup Error", "severity": "error",
+                 "message": f"Could not retrieve or filter explores: {e}"
+             }]
 
-            # Use ThreadPoolExecutor for concurrency
-            with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
-                # Map _test_explore function to each explore
-                futures = {executor.submit(self._test_explore, explore): explore for explore in explores_to_test}
+        logger.info(f"Starting SQL validation for {len(explores_to_test)} explores (Concurrency: {self.concurrency})...")
 
-                # Process results as they complete
-                for future in as_completed(futures):
-                    explore = futures[future]
-                    try:
-                        # Check if the future raised an exception (handled within _test_explore)
-                        future.result()
-                    except Exception as exc:
-                        # This catches exceptions *during* future execution,
-                        # but _test_explore should handle SDK errors internally.
-                        # Log unexpected errors here.
-                        explore_key = f"{explore['model']}/{explore['name']}"
-                        logger.error(f"Unexpected error testing explore {explore_key}: {exc}")
-                        self.errors[explore_key] = f"Unexpected error: {exc}"
+        with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
+            future_to_explore = {
+                executor.submit(self._test_explore, explore): explore
+                for explore in explores_to_test
+            }
+            test_count = len(future_to_explore)
+            logger.info(f"Submitted {test_count} SQL test tasks to thread pool.")
 
-            # Log results
-            self._log_results()
+            for future in as_completed(future_to_explore):
+                explore = future_to_explore[future]
+                explore_key = f"{explore['model']}/{explore['name']}"
+                try:
+                    result_error = future.result()
+                    if result_error:
+                        all_errors.append(result_error)
+                except Exception as exc:
+                    logger.error(f"Unexpected internal error processing result for explore {explore_key}: {exc}", exc_info=True)
+                    all_errors.append({
+                        "validator": self.__class__.__name__, "type": "Internal Validator Error", "severity": "error",
+                        "model": explore.get('model'), "explore": explore.get('name'),
+                        "message": f"An internal error occurred processing SQL test result: {exc}",
+                    })
 
-            self.log_timing("SQL validation", start_time)
-
-            # Return True if no errors were recorded
-            return len(self.errors) == 0
-
-        # <<< --- ADD EXCEPTION TYPE TO CATCH --- >>>
-        # Catch the specific validation error if it propagates
-        except SQLValidationError as e:
-             logger.error(f"SQL Validation failed: {e}")
-             # Ensure errors are logged even if validation loop is interrupted
-             self._log_results()
-             return False
-        finally:
-            # Clean up temporary branch if needed
-            self.cleanup()
-
-    def _test_explore(self, explore: Dict[str, str]):
-        """Run a simple test query against a single explore.
+        return all_errors
+    
+    def _test_explore(self, explore: Dict[str, str]) -> Optional[Dict[str, Any]]:
+        """
+        Runs a simple test query against a single explore.
 
         Args:
-            explore: Dictionary containing 'model' and 'name' of the explore
+            explore: Dictionary containing 'model' and 'name' of the explore.
+
+        Returns:
+            A dictionary containing error details if validation fails, otherwise None.
         """
         model_name = explore['model']
         explore_name = explore['name']
         explore_key = f"{model_name}/{explore_name}"
         logger.debug(f"Testing explore: {explore_key}")
 
+        if self._raw_options.get("dry_run", False):
+            logger.info(f"Dry run mode: Skipping actual query execution for {explore['model']}/{explore['name']}")
+            return None
+
         try:
-            # 1. Find a dimension to query (try common patterns like 'id')
-            #    Get explore details to find fields.
+            # 1. Find a suitable dimension to query
+            logger.debug(f"Fetching fields for explore {explore_key}...")
+            # Use specific fields to minimize payload
             explore_details = self.sdk.lookml_model_explore(
                 lookml_model_name=model_name,
                 explore_name=explore_name,
-                fields="fields" # Request only the fields information
+                fields="fields(dimensions(name,type,hidden))"
             )
 
-            # Find the first available dimension
-            field_to_query = None
+            field_to_query: Optional[str] = None
             if explore_details.fields and explore_details.fields.dimensions:
-                # Prefer 'id' fields if available
-                id_fields = [d.name for d in explore_details.fields.dimensions if 'id' in d.name.lower()]
-                if id_fields:
-                    field_to_query = id_fields[0]
+                visible_dimensions = [d for d in explore_details.fields.dimensions if not d.hidden]
+                if visible_dimensions:
+                    id_fields = [d.name for d in visible_dimensions if d.name and 'id' in d.name.lower()]
+                    field_to_query = id_fields[0] if id_fields else visible_dimensions[0].name
                 else:
-                    # Fallback to the first dimension listed
-                    field_to_query = explore_details.fields.dimensions[0].name
-
+                    logger.warning(f"Explore {explore_key} has no visible dimensions.")
+                    return {
+                        "validator": self.__class__.__name__, "type": "Explore Configuration", "severity": "warning",
+                        "model": model_name, "explore": explore_name,
+                        "message": "Explore has no visible dimensions to use for SQL test query.",
+                    }
             if not field_to_query:
-                 logger.warning(f"Explore {explore_key} has no dimensions, cannot run test query.")
-                 # Optionally mark as an error or just skip
-                 # self.errors[explore_key] = "Explore has no dimensions to query."
-                 return # Skip testing this explore
+                logger.warning(f"Could not find a suitable dimension for explore {explore_key}.")
+                return {
+                    "validator": self.__class__.__name__, "type": "Explore Configuration", "severity": "warning",
+                    "model": model_name, "explore": explore_name,
+                    "message": "No dimensions found in explore.",
+                }
 
             logger.debug(f"Using field '{field_to_query}' for explore {explore_key}")
 
-            # 2. Create a simple query body using the found field
-            query_body = WriteQuery(
-                model=model_name,
-                view=explore_name,
-                fields=[field_to_query],
-                limit="1" # Limit to 1 row for efficiency
+            # 2. Create the query body
+            query_body = models40.WriteQuery(
+                model=model_name, 
+                view=explore_name, 
+                fields=[field_to_query], 
+                limit="1"
             )
 
-            # 3. Create and run the SQL query
-            #    Using run_inline_query which combines create and run
-            #    Note: run_inline_query might behave differently across versions.
-            #    If issues arise, revert to create_query + run_query.
-            self.sdk.run_inline_query(result_format="sql", body=query_body)
+            # 3. Run the query
+            logger.debug(f"Running inline query for explore {explore_key}...")
+            query_result = self.sdk.run_inline_query(result_format="json_detail", body=query_body)
 
-            # If the above line doesn't raise an SDKError, the query syntax is likely valid
+            # Check for errors in the response
+            if isinstance(query_result, dict) and query_result.get('errors'):
+                first_error = query_result['errors'][0]
+                error_message = first_error.get('message_details', first_error.get('message', 'Unknown query error'))
+                logger.error(f"Query error testing explore {explore_key}: {error_message}")
+                return {
+                    "validator": self.__class__.__name__, "type": "Query Error", "severity": "error",
+                    "model": model_name, "explore": explore_name, "field": field_to_query,
+                    "message": error_message,
+                }
+
             logger.debug(f"Explore {explore_key} SQL generated successfully.")
+            return None # Success
 
         except SDKError as e:
-            # Catch Looker SDK errors (e.g., invalid field, SQL generation error)
-            error_message = f"SDKError testing explore {explore_key}: {e.message}"
-            logger.error(error_message)
-            # Extract a cleaner error if possible from e.errors or e.message
-            clean_error = e.message # Default to full message
+            error_message = f"API error testing explore {explore_key}: {e}"
+            logger.error(error_message, exc_info=True)
+            clean_error = getattr(e, 'message', str(e))
             if hasattr(e, 'errors') and e.errors and isinstance(e.errors, list) and len(e.errors) > 0:
-                 # Try to get the first error message if available
-                 first_error = e.errors[0]
-                 if isinstance(first_error, dict) and 'message' in first_error:
-                     clean_error = first_error['message']
-
-            self.errors[explore_key] = clean_error # Store the error message
-
+                first_error = e.errors[0]
+                if isinstance(first_error, dict) and 'message' in first_error: clean_error = first_error['message']
+            return {
+                "validator": self.__class__.__name__,
+                "type": "API Error" if "fetch" in error_message.lower() else "SQL Generation Error",
+                "severity": "error", "model": model_name, "explore": explore_name,
+                "message": clean_error, "status_code": e.status if hasattr(e, 'status') else None,
+            }
         except Exception as e:
-            # Catch any other unexpected errors during the test
-            error_message = f"Unexpected error testing explore {explore_key}: {str(e)}"
-            logger.error(error_message, exc_info=True) # Log traceback for unexpected errors
-            self.errors[explore_key] = f"Unexpected error: {str(e)}"
-
-    def _log_results(self):
-        """Log SQL validation results."""
-        total_errors = len(self.errors)
-
-        logger.info("\n" + "=" * 80)
-        logger.info(f"SQL Validation Results for Project: {self.project}")
-        if self.branch:
-            logger.info(f"Branch: {self.branch}")
-        else:
-            logger.info("Branch: production")
-        logger.info("=" * 80)
-
-        if total_errors > 0:
-            logger.error(f"\nFound {total_errors} explores with SQL errors:")
-            # Sort errors by explore key for consistent output
-            sorted_error_keys = sorted(self.errors.keys())
-            for explore_key in sorted_error_keys:
-                logger.error(f"  ❌ Explore: {explore_key}")
-                # Indent error message for readability
-                # Ensure error message is a string before splitting
-                error_msg_str = str(self.errors[explore_key])
-                error_lines = error_msg_str.split('\n')
-                for line in error_lines:
-                     logger.error(f"     Error: {line.strip()}")
-        else:
-            logger.info("\nAll tested explores generated SQL successfully! ✅")
-
-        logger.info("=" * 80)
-
-        # Save errors to log file if any exist
-        if self.errors:
-            log_filename = f"sql_errors_{self.project}"
-            if self.branch:
-                # Include branch name in log file if not production
-                safe_branch_name = "".join(c if c.isalnum() else "_" for c in self.branch)
-                log_filename += f"__{safe_branch_name}"
-            log_filename += ".json"
-            log_path = os.path.join(self.log_dir, log_filename)
-
-            try:
-                os.makedirs(self.log_dir, exist_ok=True) # Ensure log dir exists
-                # Format for JSON log: key = explore, value = error message
-                with open(log_path, "w") as f:
-                    json.dump(self.errors, f, indent=2, sort_keys=True)
-                logger.info(f"Detailed SQL error report saved to: {log_path}")
-            except Exception as e:
-                logger.warning(f"Failed to save SQL error log to {log_path}: {str(e)}")
-
+            error_message = f"Unexpected internal error testing explore {explore_key}: {e}"
+            logger.error(error_message, exc_info=True)
+            return {
+                "validator": self.__class__.__name__, "type": "Internal Validator Error", "severity": "error",
+                "model": model_name, "explore": explore_name,
+                "message": error_message,
+            }
+        
+    def _test_sql_generation(self, model_name, explore_name, field):
+        query = models40.WriteQuery(model=model_name, view=explore_name, fields=[field])
+        sql = self.sdk.create_sql_query(body=query)
+        # Check if SQL was generated successfully (no errors)
+        return sql.sql is not None

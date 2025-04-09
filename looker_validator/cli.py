@@ -1,578 +1,402 @@
+# looker_validator/cli.py
 """
 Command-line interface for Looker Validator.
+Uses standard click options and relies on Config class for file loading.
+Uses --include-personal flag to control personal folder validation (default is exclude).
 """
 
 import os
 import sys
 import logging
-import yaml
+import traceback
+from typing import List, Optional, Any, Dict, Tuple
+
+import yaml # Keep yaml import for main() pre-check
 import click
-from typing import List, Optional, Any, Dict
 
-from looker_validator.config import Config
-from looker_validator.connection import LookerConnection
-from looker_validator.validators.sql_validator import SQLValidator
-from looker_validator.validators.content_validator import ContentValidator
-from looker_validator.validators.assert_validator import AssertValidator
-from looker_validator.validators.lookml_validator import LookMLValidator
-
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+# Import core components
+from .config import Config, DEFAULT_CONCURRENCY # Import the constant
+from .connection import LookerConnection
+# Import central exceptions
+from .exceptions import (
+    ValidatorError, LookerApiError, LookerBranchError, LookerConnectionError,
+    LookerAuthenticationError, ConfigError, ContentValidationError, LookMLValidationError,
+    SQLValidationError, AssertValidationError
 )
+# Import validators
+from .validators.sql_validator import SQLValidator
+from .validators.content_validator import ContentValidator
+from .validators.assert_validator import AssertValidator
+from .validators.lookml_validator import LookMLValidator
+# Import the updated printer - use specific functions
+from .printer import (
+    print_header, print_section, print_info, print_success, print_fail,
+    print_warning, print_debug, print_error_summary_table
+)
+# Import file logging setup function
+from .logger import setup_file_logging
+
+# Get root logger for the application
 logger = logging.getLogger("looker_validator")
 
 
-class ConfigFileOption(click.Option):
-    """Click option that loads values from a YAML config file."""
-    
-    def __init__(self, *args, **kwargs):
-        self.config_file_param = kwargs.pop('config_file_param', 'config_file')
-        super().__init__(*args, **kwargs)
-        
-    def handle_parse_result(self, ctx, opts, args):
-        # Check if the config file parameter is provided
-        config_file = opts.get(self.config_file_param)
-        if config_file:
-            # Load the config file
-            with open(config_file, 'r') as f:
-                config = yaml.safe_load(f)
-            
-            # Update options with config file values if not already set
-            for key, value in config.items():
-                if key not in opts or opts[key] is None:
-                    opts[key] = value
-        
-        return super().handle_parse_result(ctx, opts, args)
+# --- Custom Click Option Classes REMOVED ---
+# Removed ConfigFileOption class as it caused the TypeError and added complexity.
+# Removed env_var_option decorator; use standard @click.option with envvar=...
 
 
-def env_var_option(*param_decls, **kwargs):
-    """Decorator for options that support environment variables."""
-    env_var = kwargs.pop('env_var', None)
-    
-    if env_var and env_var in os.environ:
-        kwargs['default'] = os.environ[env_var]
-        if kwargs.get('required'):
-            kwargs['required'] = False
-    
-    # Add env var to help text
-    if env_var:
-        help_text = kwargs.get('help', '')
-        kwargs['help'] = f"{help_text} [env: {env_var}]"
-    
-    # Make it work with config files too
-    kwargs['cls'] = ConfigFileOption
-    
-    return click.option(*param_decls, **kwargs)
-
-
-def common_options(f):
-    """Common options for all commands."""
-    f = click.option(
-        "--config-file", "-c",
-        help="Path to YAML config file",
-        type=click.Path(exists=True, dir_okay=False)
-    )(f)
-    f = env_var_option(
-        "--base-url",
-        help="Looker instance URL (e.g., https://company.looker.com)",
-        env_var="LOOKER_BASE_URL",
-        required=True
-    )(f)
-    f = env_var_option(
-        "--client-id",
-        help="Looker API client ID",
-        env_var="LOOKER_CLIENT_ID",
-        required=True
-    )(f)
-    f = env_var_option(
-        "--client-secret",
-        help="Looker API client secret",
-        env_var="LOOKER_CLIENT_SECRET",
-        required=True
-    )(f)
-    f = env_var_option(
-        "--port",
-        help="Looker API port",
-        type=int,
-        env_var="LOOKER_PORT"
-    )(f)
-    f = env_var_option(
-        "--api-version",
-        help="Looker API version",
-        default="4.0",
-        show_default=True,
-        env_var="LOOKER_API_VERSION"
-    )(f)
-    f = env_var_option(
-        "--project",
-        help="Looker project name",
-        required=True,
-        env_var="LOOKER_PROJECT"
-    )(f)
-    f = env_var_option(
-        "--branch",
-        help="Git branch name (default: production)",
-        env_var="LOOKER_GIT_BRANCH"
-    )(f)
-    f = env_var_option(
-        "--commit-ref",
-        help="Git commit reference",
-        env_var="LOOKER_COMMIT_REF"
-    )(f)
-    f = env_var_option(
-        "--remote-reset",
-        help="Reset branch to remote state",
-        is_flag=True,
-        env_var="LOOKER_REMOTE_RESET"
-    )(f)
-    f = env_var_option(
-        "--log-dir",
-        help="Directory for log files",
-        default="logs",
-        show_default=True,
-        env_var="LOOKER_LOG_DIR"
-    )(f)
-    f = env_var_option(
-        "--verbose", "-v",
-        help="Enable verbose logging",
-        is_flag=True,
-        env_var="LOOKER_VERBOSE"
-    )(f)
-    f = env_var_option(
-        "--pin-imports",
-        help="Pin imported projects to specific refs (format: 'project:ref,project2:ref2')",
-        env_var="LOOKER_PIN_IMPORTS"
-    )(f)
-    f = env_var_option(
-        "--timeout",
-        help="API request timeout in seconds",
-        type=int,
-        default=600,
-        show_default=True,
-        env_var="LOOKER_TIMEOUT"
-    )(f)
-    return f
-
-
-# Create the CLI group
+# --- CLI Group ---
 @click.group()
+@click.version_option(package_name='looker-validator')
 def cli():
-    """Looker Validator - A continuous integration tool for Looker and LookML."""
+    """Looker Validator: A CI tool for Looker / LookML validation."""
     pass
 
 
+# --- Helper Function for Setup ---
+def setup_validation(kwargs: Dict[str, Any]) -> Tuple[Config, LookerConnection]:
+    """Initializes Config and LookerConnection, handling errors."""
+    try:
+        # Config init handles precedence (CLI > Env > File > Default)
+        # and validation of required fields.
+        # The config_file path is passed directly if provided via CLI.
+        config = Config(**kwargs)
+
+        # Configure logging based on final config values (verbose, log_dir)
+        if config.log_dir:
+            file_log_level = logging.DEBUG # Always log DEBUG to file
+            if not setup_file_logging(log_dir=config.log_dir, log_level=file_log_level):
+                print_warning(f"File logging setup failed. Check logs/permissions for directory: {config.log_dir}")
+        else:
+            logger.info("Log directory not specified, file logging disabled.")
+
+        # Now initialize connection
+        connection = LookerConnection(
+            base_url=config.base_url,
+            client_id=config.client_id,
+            client_secret=config.client_secret,
+            port=config.port,
+            api_version=config.api_version,
+            timeout=config.timeout,
+        )
+        return config, connection
+    except ConfigError as e:
+        print_fail(f"Configuration Error: {e}")
+        logger.critical(f"Configuration Error: {e}", exc_info=False) # No need for traceback here
+        sys.exit(2)
+    except LookerAuthenticationError as e:
+        print_fail(f"Looker Authentication Failed: {e}")
+        logger.critical(f"Looker Authentication Failed: {e}", exc_info=True)
+        sys.exit(3)
+    except Exception as e:
+        print_fail(f"Initialization Error: {e}")
+        logger.critical(f"Initialization Error: {e}", exc_info=True)
+        sys.exit(4)
+
+
+# --- CLI Commands ---
+
 @cli.command()
-@click.option(
-    "--config-file", "-c",
-    help="Path to YAML config file",
-    type=click.Path(exists=True, dir_okay=False)
-)
-@env_var_option(
-    "--base-url",
-    help="Looker instance URL (e.g., https://company.looker.com)",
-    env_var="LOOKER_BASE_URL",
-    required=True
-)
-@env_var_option(
-    "--client-id",
-    help="Looker API client ID",
-    env_var="LOOKER_CLIENT_ID",
-    required=True
-)
-@env_var_option(
-    "--client-secret",
-    help="Looker API client secret",
-    env_var="LOOKER_CLIENT_SECRET",
-    required=True
-)
-@env_var_option(
-    "--port",
-    help="Looker API port",
-    type=int,
-    env_var="LOOKER_PORT"
-)
-@env_var_option(
-    "--api-version",
-    help="Looker API version",
-    default="4.0",
-    show_default=True,
-    env_var="LOOKER_API_VERSION"
-)
-@env_var_option(
-    "--project",
-    help="Looker project name",
-    env_var="LOOKER_PROJECT"
-)  # Note: Not required for connect
-@env_var_option(
-    "--timeout",
-    help="API request timeout in seconds",
-    type=int,
-    default=600,
-    show_default=True,
-    env_var="LOOKER_TIMEOUT"
-)
+# Use standard click.option
+@click.option("--config-file", "-c", help="Path to YAML config file.", type=click.Path(exists=True, dir_okay=False)) # Removed config_file_param
+@click.option("--base-url", help="Looker instance URL. [env: LOOKER_BASE_URL]", envvar="LOOKER_BASE_URL")
+@click.option("--client-id", help="Looker API client ID. [env: LOOKER_CLIENT_ID]", envvar="LOOKER_CLIENT_ID")
+@click.option("--client-secret", help="Looker API client secret. [env: LOOKER_CLIENT_SECRET]", envvar="LOOKER_CLIENT_SECRET", prompt=False, hide_input=True)
+@click.option("--port", help="Looker API port. [env: LOOKER_PORT]", type=int, envvar="LOOKER_PORT")
+@click.option("--api-version", help="Looker API version. [env: LOOKER_API_VERSION]", default="4.0", show_default=True, envvar="LOOKER_API_VERSION")
+@click.option("--timeout", help="API request timeout. [env: LOOKER_TIMEOUT]", type=int, default=600, show_default=True, envvar="LOOKER_TIMEOUT")
+@click.option("--verbose", "-v", help="Enable verbose (DEBUG) logging. [env: LOOKER_VERBOSE]", is_flag=True, default=False, envvar="LOOKER_VERBOSE")
 def connect(**kwargs):
-    """Test connection to Looker API."""
+    """Tests the connection to the Looker API."""
+    print_header("Testing Looker Connection")
+    config, connection = setup_validation(kwargs) # Handles setup errors including missing required config
+
     try:
-        # Initialize config
-        config = Config(**kwargs)
-        
-        # Initialize connection
-        connection = LookerConnection(
-            base_url=config.base_url,
-            client_id=config.client_id,
-            client_secret=config.client_secret,
-            port=config.port,
-            api_version=config.api_version,
-            timeout=config.timeout,
-        )
-        
-        # Test connection
-        success, message = connection.test_connection()
-        
-        if success:
-            click.echo(click.style(message, fg="green"))
-            sys.exit(0)
-        else:
-            click.echo(click.style(message, fg="red"))
-            sys.exit(1)
+        success_message = connection.test_connection() # Raises error on failure
+        print_success(success_message)
+        sys.exit(0)
+    except LookerConnectionError as e:
+        print_fail(f"Connection Test Failed: {e}")
+        logger.error(f"Connection Test Failed: {e}", exc_info=True)
+        sys.exit(1)
     except Exception as e:
-        click.echo(click.style(f"Error: {str(e)}", fg="red"))
-        if kwargs.get("verbose"):
-            import traceback
-            click.echo(traceback.format_exc())
+        print_fail(f"Unexpected Error during connection test: {e}")
+        logger.error(f"Unexpected Error during connection test: {e}", exc_info=True)
         sys.exit(1)
 
 
+# --- Common Validator Options Decorator ---
+def validator_options(f):
+    """Decorator for common options needed by most validator commands."""
+    # Use standard click.option
+    f = click.option("--config-file", "-c", help="Path to YAML config file.", type=click.Path(exists=True, dir_okay=False))(f) # Removed config_file_param
+    f = click.option("--base-url", help="Looker instance URL. [env: LOOKER_BASE_URL]", envvar="LOOKER_BASE_URL")(f)
+    f = click.option("--client-id", help="Looker API client ID. [env: LOOKER_CLIENT_ID]", envvar="LOOKER_CLIENT_ID")(f)
+    f = click.option("--client-secret", help="Looker API client secret. [env: LOOKER_CLIENT_SECRET]", envvar="LOOKER_CLIENT_SECRET", prompt=False, hide_input=True)(f)
+    f = click.option("--port", help="Looker API port. [env: LOOKER_PORT]", type=int, envvar="LOOKER_PORT")(f)
+    f = click.option("--api-version", help="Looker API version. [env: LOOKER_API_VERSION]", default="4.0", show_default=True, envvar="LOOKER_API_VERSION")(f)
+    f = click.option("--timeout", help="API request timeout. [env: LOOKER_TIMEOUT]", type=int, default=600, show_default=True, envvar="LOOKER_TIMEOUT")(f)
+    # Project IS required for validators
+    f = click.option("--project", help="Looker project name. [env: LOOKER_PROJECT]", required=True, envvar="LOOKER_PROJECT")(f)
+    # Git state options
+    f = click.option("--branch", help="Git branch name (default: production). [env: LOOKER_GIT_BRANCH]", envvar="LOOKER_GIT_BRANCH")(f)
+    f = click.option("--commit-ref", help="Git commit reference (overrides branch). [env: LOOKER_COMMIT_REF]", envvar="LOOKER_COMMIT_REF")(f)
+    f = click.option("--remote-reset", help="Reset branch to remote state before validating. [env: LOOKER_REMOTE_RESET]", is_flag=True, default=False, envvar="LOOKER_REMOTE_RESET")(f)
+    f = click.option("--pin-imports", help="Pin imported projects (format: 'proj:ref,proj2:ref2'). [env: LOOKER_PIN_IMPORTS]", envvar="LOOKER_PIN_IMPORTS")(f)
+    # General options
+    f = click.option("--log-dir", help="Directory for logs and artifacts. [env: LOOKER_LOG_DIR]", default="logs", show_default=True, envvar="LOOKER_LOG_DIR")(f)
+    f = click.option("--verbose", "-v", help="Enable verbose (DEBUG) logging. [env: LOOKER_VERBOSE]", is_flag=True, default=False, envvar="LOOKER_VERBOSE")(f)
+    return f
+
+# --- Helper to run a validator and handle results/errors ---
+def run_validator(validator_class, command_name: str, config: Config, connection: LookerConnection, **kwargs):
+    """Instantiates and runs a validator, handling common errors and reporting."""
+    print_header(f"{command_name} Validator")
+    # Pass all config options collected into the Config object
+    validator_kwargs = config.as_dict()
+
+    # Remove 'project' from validator_kwargs if it exists to avoid duplicate parameter error
+    if 'project' in validator_kwargs:
+        del validator_kwargs['project']
+
+    all_errors: List[Dict[str, Any]] = []
+    exit_code = 0
+    try:
+        # Ensure project is set for validators (redundant check, but safe)
+        if not config.project:
+             raise ConfigError("Looker project must be specified using --project or LOOKER_PROJECT for this command.")
+
+        validator = validator_class(connection, config.project, **validator_kwargs)
+        all_errors = validator.validate() # Returns list of error dicts
+
+        if all_errors:
+            print_error_summary_table(all_errors)
+            # Determine exit code based on highest severity found
+            highest_severity = "info"
+            if any(e.get("severity") == "error" for e in all_errors):
+                highest_severity = "error"
+            elif any(e.get("severity") == "warning" for e in all_errors):
+                highest_severity = "warning"
+
+            if highest_severity == "error":
+                 exit_code = 1
+            else:
+                 print_warning(f"Validation completed with {highest_severity} messages.")
+                 exit_code = 0 # Treat warnings/info as success for CI exit code
+        else:
+            # Success message logged by validator now
+            pass
+
+    # Catch specific errors first
+    except ConfigError as e: # Catch config errors found after initial setup
+        print_fail(f"Configuration Error: {e}")
+        logger.critical(f"Configuration Error: {e}", exc_info=False)
+        exit_code = 2
+    except (LookerConnectionError, LookerBranchError, LookerApiError, ValidatorError) as e:
+        print_fail(f"{command_name} Validation Failed: {e}")
+        logger.error(f"{command_name} Validation Failed: {e}", exc_info=True)
+        exit_code = 1
+    except Exception as e:
+        print_fail(f"Unexpected Error during {command_name} validation: {e}")
+        logger.exception(f"Unexpected Error during {command_name} validation:")
+        exit_code = 1
+
+    sys.exit(exit_code)
+
+
+# --- Validator Commands ---
+
 @cli.command()
-@common_options
-@env_var_option(
-    "--explores",
-    help="Model/explore selectors (e.g., 'model_a/*', '-model_b/explore_c')",
-    multiple=True,
-    env_var="LOOKER_EXPLORES"
-)
-@env_var_option(
-    "--concurrency",
-    help="Number of concurrent queries",
-    type=int,
-    default=10,
-    show_default=True,
-    env_var="LOOKER_CONCURRENCY"
-)
-@env_var_option(
-    "--fail-fast",
-    help="Only run explore-level queries",
-    is_flag=True,
-    env_var="LOOKER_FAIL_FAST"
-)
-@env_var_option(
-    "--profile", "-p",
-    help="Profile query execution time",
-    is_flag=True,
-    env_var="LOOKER_PROFILE"
-)
-@env_var_option(
-    "--runtime-threshold",
-    help="Runtime threshold for profiler (seconds)",
-    type=int,
-    default=5,
-    show_default=True,
-    env_var="LOOKER_RUNTIME_THRESHOLD"
-)
-@env_var_option(
-    "--incremental",
-    help="Only show errors unique to the branch",
-    is_flag=True,
-    env_var="LOOKER_INCREMENTAL"
-)
-@env_var_option(
-    "--target",
-    help="Target branch for incremental comparison (default: production)",
-    env_var="LOOKER_TARGET"
-)
-@env_var_option(
-    "--ignore-hidden",
-    help="Ignore hidden dimensions",
-    is_flag=True,
-    env_var="LOOKER_IGNORE_HIDDEN"
-)
-@env_var_option(
-    "--chunk-size",
-    help="Maximum number of dimensions per query",
-    type=int,
-    default=500,
-    show_default=True,
-    env_var="LOOKER_CHUNK_SIZE"
-)
-@env_var_option(
-    "--max-depth",
-    help="Maximum depth for binary search in SQL validation",
-    type=int,
-    default=5,
-    show_default=True,
-    env_var="LOOKER_MAX_DEPTH"
-)
+@validator_options
+@click.option("--explores", help="Filter explores (e.g., 'model/*', '-model/explore'). [env: LOOKER_EXPLORES]", multiple=True, envvar="LOOKER_EXPLORES")
+@click.option("--concurrency", help="Number of concurrent queries. [env: LOOKER_CONCURRENCY]", type=int, default=DEFAULT_CONCURRENCY, show_default=True, envvar="LOOKER_CONCURRENCY")
+# Add SQL specific options if needed, e.g., --dry-run
+# @click.option("--dry-run", help="Skip query execution (validate SQL generation only). [env: LOOKER_DRY_RUN]", is_flag=True, default=False, envvar="LOOKER_DRY_RUN")
 def sql(**kwargs):
-    """Run SQL validation on Looker project."""
-    try:
-        # Initialize config
-        config = Config(**kwargs)
-        
-        # Initialize connection
-        connection = LookerConnection(
-            base_url=config.base_url,
-            client_id=config.client_id,
-            client_secret=config.client_secret,
-            port=config.port,
-            api_version=config.api_version,
-            timeout=config.timeout,
-        )
-        
-        # Set log level if verbose
-        if kwargs.get("verbose"):
-            logging.getLogger().setLevel(logging.DEBUG)
-        
-        # Initialize and run validator
-        validator = SQLValidator(
-            connection=connection,
-            project=config.project,
-            branch=config.branch,
-            commit_ref=config.commit_ref,
-            remote_reset=config.remote_reset,
-            explores=config.explores,
-            concurrency=config.concurrency,
-            fail_fast=config.fail_fast,
-            profile=config.profile,
-            runtime_threshold=config.runtime_threshold,
-            incremental=config.incremental,
-            target=config.target,
-            max_depth=config.max_depth,
-            ignore_hidden=config.ignore_hidden,
-            chunk_size=config.chunk_size,
-            log_dir=config.log_dir,
-            pin_imports=config.pin_imports,
-        )
-        
-        success = validator.validate()
-        
-        if success:
-            sys.exit(0)
-        else:
-            sys.exit(1)
-    except Exception as e:
-        click.echo(click.style(f"Error: {str(e)}", fg="red"))
-        if kwargs.get("verbose"):
-            import traceback
-            click.echo(traceback.format_exc())
-        sys.exit(1)
+    """Runs SQL validation: checks if explores generate valid SQL."""
+    config, connection = setup_validation(kwargs)
+    run_validator(SQLValidator, "SQL", config, connection, **kwargs)
 
 
 @cli.command()
-@common_options
-@env_var_option(
-    "--explores",
-    help="Model/explore selectors (e.g., 'model_a/*', '-model_b/explore_c')",
-    multiple=True,
-    env_var="LOOKER_EXPLORES"
-)
-@env_var_option(
-    "--folders",
-    help="Folder IDs to include/exclude (e.g., '25', '-33')",
-    multiple=True,
-    env_var="LOOKER_FOLDERS"
-)
-@env_var_option(
-    "--exclude-personal",
-    help="Exclude content in personal folders",
-    is_flag=True,
-    env_var="LOOKER_EXCLUDE_PERSONAL"
-)
-@env_var_option(
-    "--incremental",
-    help="Only show errors unique to the branch",
-    is_flag=True,
-    env_var="LOOKER_INCREMENTAL"
-)
-@env_var_option(
-    "--target",
-    help="Target branch for incremental comparison (default: production)",
-    env_var="LOOKER_TARGET"
-)
+@validator_options
+@click.option("--explores", help="Filter content by model/explore. [env: LOOKER_EXPLORES]", multiple=True, envvar="LOOKER_EXPLORES")
+@click.option("--folders", help="Filter content by folder ID (e.g., '123', '-456'). [env: LOOKER_FOLDERS]", multiple=True, envvar="LOOKER_FOLDERS")
+# --- FLAG LOGIC REMAINS THE SAME AS PREVIOUS FIX ---
+# Uses --include-personal flag, default False (meaning exclude is default)
+@click.option("--include-personal", help="Include content in personal folders (default: exclude). [env: LOOKER_INCLUDE_PERSONAL]", is_flag=True, default=False, envvar="LOOKER_INCLUDE_PERSONAL")
+# --- END FLAG LOGIC ---
+@click.option("--incremental", help="Only report errors unique to the current branch. [env: LOOKER_INCREMENTAL]", is_flag=True, default=False, envvar="LOOKER_INCREMENTAL")
+@click.option("--target", help="Target branch for incremental comparison (default: production). [env: LOOKER_TARGET]", envvar="LOOKER_TARGET")
 def content(**kwargs):
-    """Run content validation on Looker project."""
-    try:
-        # Initialize config
-        config = Config(**kwargs)
-        
-        # Initialize connection
-        connection = LookerConnection(
-            base_url=config.base_url,
-            client_id=config.client_id,
-            client_secret=config.client_secret,
-            port=config.port,
-            api_version=config.api_version,
-            timeout=config.timeout,
-        )
-        
-        # Set log level if verbose
-        if kwargs.get("verbose"):
-            logging.getLogger().setLevel(logging.DEBUG)
-        
-        # Initialize and run validator
-        validator = ContentValidator(
-            connection=connection,
-            project=config.project,
-            branch=config.branch,
-            commit_ref=config.commit_ref,
-            remote_reset=config.remote_reset,
-            explores=config.explores,
-            folders=config.folders,
-            exclude_personal=config.exclude_personal,
-            incremental=config.incremental,
-            target=config.target,
-            log_dir=config.log_dir,
-            pin_imports=config.pin_imports,
-        )
-        
-        success = validator.validate()
-        
-        if success:
-            sys.exit(0)
-        else:
-            sys.exit(1)
-    except Exception as e:
-        click.echo(click.style(f"Error: {str(e)}", fg="red"))
-        if kwargs.get("verbose"):
-            import traceback
-            click.echo(traceback.format_exc())
-        sys.exit(1)
+    """Runs Content validation: checks Looks and Dashboards for errors."""
+    # --- TRANSFORMATION REMAINS THE SAME ---
+    # Map the --include-personal flag to the internal exclude_personal config value
+    include_personal_flag = kwargs.pop('include_personal', False) # Get value from Click
+    kwargs['exclude_personal'] = not include_personal_flag # Set the inverse for Config
+    # --- END TRANSFORMATION ---
+
+    config, connection = setup_validation(kwargs)
+    run_validator(ContentValidator, "Content", config, connection, **kwargs)
 
 
-@cli.command(name="assert")  # Use name parameter to override the function name
-@common_options
-@env_var_option(
-    "--explores",
-    help="Model/explore selectors (e.g., 'model_a/*', '-model_b/explore_c')",
-    multiple=True,
-    env_var="LOOKER_EXPLORES"
-)
+@cli.command(name="assert")
+@validator_options
+@click.option("--explores", help="Filter tests by model/explore. [env: LOOKER_EXPLORES]", multiple=True, envvar="LOOKER_EXPLORES")
+@click.option("--concurrency", help="Number of concurrent tests. [env: LOOKER_CONCURRENCY]", type=int, default=DEFAULT_CONCURRENCY, show_default=True, envvar="LOOKER_CONCURRENCY")
 def assert_command(**kwargs):
-    """Run LookML data tests on Looker project."""
-    try:
-        # Initialize config
-        config = Config(**kwargs)
-        
-        # Initialize connection
-        connection = LookerConnection(
-            base_url=config.base_url,
-            client_id=config.client_id,
-            client_secret=config.client_secret,
-            port=config.port,
-            api_version=config.api_version,
-            timeout=config.timeout,
-        )
-        
-        # Set log level if verbose
-        if kwargs.get("verbose"):
-            logging.getLogger().setLevel(logging.DEBUG)
-        
-        # Initialize and run validator
-        validator = AssertValidator(
-            connection=connection,
-            project=config.project,
-            branch=config.branch,
-            commit_ref=config.commit_ref,
-            remote_reset=config.remote_reset,
-            explores=config.explores,
-            log_dir=config.log_dir,
-            pin_imports=config.pin_imports,
-        )
-        
-        success = validator.validate()
-        
-        if success:
-            sys.exit(0)
-        else:
-            sys.exit(1)
-    except Exception as e:
-        click.echo(click.style(f"Error: {str(e)}", fg="red"))
-        if kwargs.get("verbose"):
-            import traceback
-            click.echo(traceback.format_exc())
-        sys.exit(1)
+    """Runs Assert validation: executes LookML data tests."""
+    config, connection = setup_validation(kwargs)
+    run_validator(AssertValidator, "Assert", config, connection, **kwargs)
 
 
 @cli.command()
-@common_options
-@env_var_option(
-    "--severity",
-    help="Severity threshold (info, warning, error)",
-    type=click.Choice(["info", "warning", "error"]),
-    default="warning",
-    show_default=True,
-    env_var="LOOKER_SEVERITY"
-)
+@validator_options
+@click.option("--severity", help="Minimum issue severity to report as failure. [env: LOOKER_SEVERITY]", type=click.Choice(["info", "warning", "error"]), default="warning", show_default=True, envvar="LOOKER_SEVERITY")
 def lookml(**kwargs):
-    """Run LookML validation on Looker project."""
+    """Runs LookML validation: checks LookML syntax and references."""
+    min_severity_arg = kwargs.get("severity", "warning")
+    print_header("LookML Validator")
+    config, connection = setup_validation(kwargs)
+
+    validator_kwargs = config.as_dict()
+
+    # Remove 'project' from validator_kwargs if it exists
+    if 'project' in validator_kwargs:
+        del validator_kwargs['project']
+
+    all_issues: List[Dict[str, Any]] = []
+    exit_code = 0
     try:
-        # Initialize config
-        config = Config(**kwargs)
-        
-        # Initialize connection
-        connection = LookerConnection(
-            base_url=config.base_url,
-            client_id=config.client_id,
-            client_secret=config.client_secret,
-            port=config.port,
-            api_version=config.api_version,
-            timeout=config.timeout,
-        )
-        
-        # Set log level if verbose
-        if kwargs.get("verbose"):
-            logging.getLogger().setLevel(logging.DEBUG)
-        
-        # Initialize and run validator
-        validator = LookMLValidator(
-            connection=connection,
-            project=config.project,
-            branch=config.branch,
-            commit_ref=config.commit_ref,
-            remote_reset=config.remote_reset,
-            severity=config.severity,
-            log_dir=config.log_dir,
-            pin_imports=config.pin_imports,
-        )
-        
-        success = validator.validate()
-        
-        if success:
-            sys.exit(0)
+        # Ensure project is set
+        if not config.project:
+             raise ConfigError("Looker project must be specified using --project or LOOKER_PROJECT for the lookml command.")
+
+        validator = LookMLValidator(connection, config.project, **validator_kwargs)
+        all_issues = validator.validate() # Returns list of all issues found
+
+        severity_levels = {"info": 0, "warning": 1, "error": 2}
+        min_level = severity_levels.get(min_severity_arg.lower(), 1)
+        failing_issues = [
+            issue for issue in all_issues
+            if severity_levels.get(str(issue.get("severity")).lower(), 0) >= min_level
+        ]
+
+        if failing_issues:
+            print_warning(f"Displaying issues with severity '{min_severity_arg}' or higher:")
+            print_error_summary_table(failing_issues)
+            # Exit with error code only if there are 'error' severity issues
+            if any(severity_levels.get(str(issue.get("severity")).lower(), 0) >= severity_levels["error"] for issue in failing_issues):
+                 exit_code = 1
+            else:
+                 print_warning("Validation completed with only warnings.")
+                 exit_code = 0 # Treat warnings as success for exit code
+        elif all_issues:
+             print_info(f"LookML validation found only issues below severity threshold '{min_severity_arg}'.")
+             if config.verbose:
+                 print_info("Displaying all found issues (including lower severity):")
+                 print_error_summary_table(all_issues)
+             exit_code = 0
         else:
-            sys.exit(1)
+            pass # Logger in validator handles success message
+
+    except ConfigError as e: # Catch config errors found after initial setup
+        print_fail(f"Configuration Error: {e}")
+        logger.critical(f"Configuration Error: {e}", exc_info=False)
+        exit_code = 2
+    except (LookerConnectionError, LookerBranchError, LookerApiError, ValidatorError, LookMLValidationError) as e:
+        print_fail(f"LookML Validation Failed: {e}")
+        logger.error(f"LookML Validation Failed: {e}", exc_info=True)
+        exit_code = 1
     except Exception as e:
-        click.echo(click.style(f"Error: {str(e)}", fg="red"))
-        if kwargs.get("verbose"):
-            import traceback
-            click.echo(traceback.format_exc())
-        sys.exit(1)
+        print_fail(f"Unexpected Error during LookML validation: {e}")
+        logger.exception("Unexpected Error during LookML validation:")
+        exit_code = 1
+
+    sys.exit(exit_code)
+
+
+# --- Main Entry Point ---
+def configure_logging(verbose: bool, log_dir: Optional[str]):
+     """Configure root logger level and add file handler."""
+     log_level = logging.DEBUG if verbose else logging.INFO
+     # Ensure handlers are removed before adding new ones if necessary
+     root_logger = logging.getLogger()
+     # for handler in root_logger.handlers[:]: # Iterate over a copy
+     #      root_logger.removeHandler(handler)
+
+     logging.basicConfig(
+         level=log_level,
+         format="%(asctime)s [%(levelname)-7s] %(name)s: %(message)s",
+         datefmt="%Y-%m-%d %H:%M:%S",
+         force=True # Override existing basicConfig if any
+     )
+     # Mute noisy libraries if needed
+     # logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+     # Set looker_sdk logger level
+     sdk_log_level = logging.DEBUG if verbose else logging.INFO # Show SDK INFO by default
+     logging.getLogger("looker_sdk").setLevel(sdk_log_level)
+
+     logger.info(f"Console logging level set to {logging.getLevelName(log_level)}")
+
+     # Setup file logging using the function from logger.py
+     if log_dir:
+         file_log_level = logging.DEBUG # Always log DEBUG to file for details
+         if not setup_file_logging(log_dir=log_dir, log_level=file_log_level):
+             print_warning(f"File logging setup failed. Check logs/permissions for directory: {log_dir}")
+     else:
+          logger.info("Log directory not specified, file logging disabled.")
 
 
 def main():
     """Main entry point for the CLI."""
-    # Check for NO_COLOR environment variable
-    if os.environ.get("NO_COLOR"):
-        # Disable colors in click
-        click.disable_colors = True
-    
+    verbose = False
+    log_dir_arg = "logs" # Default log dir
+    config_file_arg = None
+    temp_args = sys.argv[1:]
+
+    # Quick parse for verbose, log_dir, config_file BEFORE Click fully parses
+    # Allows logging and config file loading to influence defaults early
+    if "-v" in temp_args or "--verbose" in temp_args: verbose = True
+    try: # Find log_dir
+        if "--log-dir" in temp_args:
+            log_dir_index = temp_args.index("--log-dir") + 1
+            if log_dir_index < len(temp_args): log_dir_arg = temp_args[log_dir_index]
+    except ValueError: pass
+    try: # Find config_file
+        if "--config-file" in temp_args:
+            config_file_index = temp_args.index("--config-file") + 1
+            if config_file_index < len(temp_args): config_file_arg = temp_args[config_file_index]
+        elif "-c" in temp_args:
+             config_file_index = temp_args.index("-c") + 1
+             if config_file_index < len(temp_args): config_file_arg = temp_args[config_file_index]
+    except ValueError: pass
+
+    # If config file path found early, try loading it to get log_dir if not specified otherwise
+    if config_file_arg and log_dir_arg == "logs": # Only override default
+         try:
+             with open(config_file_arg, 'r', encoding='utf-8') as f:
+                 temp_config = yaml.safe_load(f)
+                 if isinstance(temp_config, dict) and temp_config.get('log_dir'):
+                      log_dir_arg = temp_config['log_dir']
+         except Exception:
+              pass # Ignore errors here, full loading happens later
+
+    # Setup logging BEFORE invoking Click command parsing
+    configure_logging(verbose=verbose, log_dir=log_dir_arg)
+
     try:
-        cli()
+        # Execute the Click CLI application
+        # Pass context_settings={'auto_envvar_prefix': 'LOOKER'} if needed globally
+        cli(prog_name="looker-validator")
+    except SystemExit as e:
+         if e.code is not None and e.code != 0: logger.info(f"Exiting with status code {e.code}")
+         sys.exit(e.code)
     except Exception as e:
-        click.echo(click.style(f"Unhandled error: {str(e)}", fg="red"))
-        sys.exit(1)
+        print_fail(f"Unhandled Top-Level Error: {e}")
+        logger.exception("Unhandled Top-Level Error:")
+        sys.exit(99)
 
 
 if __name__ == "__main__":

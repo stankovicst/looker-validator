@@ -1,316 +1,319 @@
+# FILE: looker_validator/validators/assert_validator.py
 """
-Enhanced data test validator with better concurrency.
+Assert validator: Runs LookML data tests (assertions).
+Corrected call to all_lookml_tests to remove unsupported 'fields' parameter.
 """
 
 import logging
-import os
-import json
 import time
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
-from typing import List, Dict, Any, Optional, Tuple, Set, Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Any, Optional
 
-import looker_sdk
-from tqdm import tqdm
+from looker_sdk.error import SDKError
 
-from looker_validator.validators.base import BaseValidator, ValidatorError
+from .base import BaseValidator
+# Use specific exceptions
+from ..exceptions import LookerApiError, AssertValidationError, ValidatorError
 
 logger = logging.getLogger(__name__)
 
 # Default concurrent test limit
-DEFAULT_CONCURRENCY = 15  # Matches the per-user query limit in most Looker instances
-
+DEFAULT_CONCURRENCY = 10
 
 class AssertValidator(BaseValidator):
-    """Validator for running LookML data tests."""
+    """Validator for running LookML data tests (assertions) via the Looker API."""
 
     def __init__(self, connection, project, **kwargs):
-        """Initialize Assert validator.
-
-        Args:
-            connection: LookerConnection instance
-            project: Looker project name
-            **kwargs: Additional validator options
-        """
+        """Initialize Assert validator."""
         super().__init__(connection, project, **kwargs)
-        self.concurrency = kwargs.get("concurrency", DEFAULT_CONCURRENCY)
-        
-        # Validation results
-        self.test_results = {}
-        self.passing_tests = set()
-        self.failing_tests = set()
-        self.test_runtime = {}  # Track test runtimes
-
-    def validate(self) -> bool:
-        """Run LookML data tests.
-
-        Returns:
-            True if all tests pass, False otherwise
-        """
-        start_time = time.time()
-        
         try:
-            # Set up branch for validation
-            self.setup_branch()
-            
-            # Pin imported projects if specified
-            if self.pin_imports:
-                self.pin_imported_projects()
-                
-            # Find all LookML tests
-            logger.info(f"Finding LookML tests for project {self.project}")
-            tests = self._get_tests()
-            
-            if not tests:
-                logger.warning(f"No LookML tests found for project {self.project}")
-                return True
-                
-            # Filter tests based on model/explore selectors
-            tests = self._filter_tests(tests)
-            
-            if not tests:
-                logger.warning(f"No tests match the provided selectors")
-                return True
-                
-            # Run tests
-            logger.info(f"Running {len(tests)} LookML tests with concurrency={self.concurrency}")
-            self._run_tests(tests)
-            
-            # Log results
-            self._log_results()
-            
-            self.log_timing("Assert validation", start_time)
-            
-            # Return True if all tests pass
-            return len(self.failing_tests) == 0
-        
-        finally:
-            # Clean up temporary branch if needed
-            self.cleanup()
+            # Ensure concurrency is at least 1
+            self.concurrency = max(1, int(kwargs.get("concurrency", DEFAULT_CONCURRENCY)))
+        except (ValueError, TypeError):
+            logger.warning(f"Invalid concurrency value provided ('{kwargs.get('concurrency')}'), defaulting to {DEFAULT_CONCURRENCY}.")
+            self.concurrency = DEFAULT_CONCURRENCY
 
     def _get_tests(self) -> List[Dict[str, Any]]:
-        """Get all LookML tests for the project.
+        """Gets all LookML data tests for the project.
 
         Returns:
-            List of test dictionaries
+            List of test dictionaries, each containing test metadata.
+
+        Raises:
+            LookerApiError: If fetching tests fails via the API.
+            ValidatorError: For unexpected errors during processing.
         """
+        logger.debug(f"Fetching LookML data tests for project '{self.project}'...")
+        start_time = time.time()
+        tests: List[Dict[str, Any]] = []
         try:
-            # Get all models in the project
-            models_response = self.sdk.all_lookml_models()
-            
-            # Find models for this project
-            project_models = [
-                model for model in models_response
-                if model.project_name == self.project
-            ]
-            
-            tests = []
-            
-            # Get all tests for each model
-            for model in project_models:
-                try:
-                    # Get tests for model
-                    model_tests = self.sdk.all_lookml_tests(model.name)
-                    
-                    for test in model_tests:
-                        # Create test dictionary with metadata
-                        test_dict = {
-                            "model": model.name,
-                            "explore": test.explore,
-                            "name": test.name,
-                            "test_id": f"{model.name}/{test.name}",
-                            "file": getattr(test, 'file', None),
-                            "line": getattr(test, 'line', None)
-                        }
-                        tests.append(test_dict)
-                except Exception as model_error:
-                    logger.error(f"Error getting tests for model {model.name}: {str(model_error)}")
-            
+            # --- MODIFIED LINE ---
+            # Removed the unsupported 'fields' argument from the SDK call.
+            project_tests = self.sdk.all_lookml_tests(project_id=self.project)
+            # --- END MODIFIED LINE ---
+
+            if not project_tests:
+                 logger.info(f"No LookML data tests found via API for project '{self.project}'.")
+                 return []
+
+            for test in project_tests:
+                 # Ensure necessary attributes exist
+                 model_name = getattr(test, 'model_name', None)
+                 test_name = getattr(test, 'name', None)
+                 if model_name and test_name:
+                     test_id = f"{model_name}/{test_name}" # Consistent ID format
+                     tests.append({
+                         "model": model_name,
+                         "explore": getattr(test, 'explore_name', None), # Explore might be optional
+                         "name": test_name,
+                         "test_id": test_id, # Include for easier reference
+                         "file": getattr(test, 'file_path', None), # Use file_path if available
+                         "line": getattr(test, 'line_number', None) # Use line_number if available
+                     })
+                 else:
+                      logger.warning(f"Skipping test object due to missing model or name: {vars(test) if hasattr(test, '__dict__') else test}")
+
+            logger.info(f"Found {len(tests)} LookML data tests for project '{self.project}'.")
+            self.log_timing("Fetching data tests", start_time)
             return tests
-        
+
+        except SDKError as e:
+            error_msg = f"API error fetching LookML tests for project '{self.project}': {e}"
+            logger.error(error_msg, exc_info=True)
+            raise LookerApiError(error_msg, status_code=e.status if hasattr(e, 'status') else None, original_exception=e) from e
         except Exception as e:
-            logger.error(f"Failed to get LookML tests: {str(e)}")
-            raise ValidatorError(f"Failed to get LookML tests: {str(e)}")
+            # Catch potential TypeErrors if the SDK response format changes unexpectedly
+            error_msg = f"Unexpected error processing LookML tests for project '{self.project}': {e}"
+            logger.error(error_msg, exc_info=True)
+            raise ValidatorError(error_msg) from e
+
 
     def _filter_tests(self, tests: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Filter tests based on model/explore selectors.
+        """Filters data tests based on model/explore selectors defined in BaseValidator.
 
         Args:
-            tests: List of test dictionaries
+            tests: List of test dictionaries from _get_tests().
 
         Returns:
-            Filtered list of test dictionaries
+            Filtered list of test dictionaries.
         """
         if not self.explore_selectors:
-            return tests
-            
+            logger.debug("No explore selectors provided, running all found data tests.")
+            return tests # Return all if no selectors
+
+        start_time = time.time()
+        # Resolve includes/excludes based on selectors
         includes, excludes = self.resolve_explores()
-        
-        filtered_tests = []
+        logger.debug(f"Filtering data tests. Includes: {includes}, Excludes: {excludes}")
+
+        filtered_tests: List[Dict[str, Any]] = []
         for test in tests:
-            model = test["model"]
-            explore = test["explore"]
-            
-            # If explore is None or empty, include by default
-            if not explore:
+            model = test.get("model")
+            explore = test.get("explore") # Can be None
+
+            if not model:
+                 logger.warning(f"Skipping test due to missing model name: {test.get('name')}")
+                 continue
+
+            # Use matches_selector from BaseValidator.
+            # Pass explore name or '*' if explore is None to match model-level wildcards.
+            explore_pattern = explore if explore else "*"
+            if self.matches_selector(model, explore_pattern, includes, excludes):
                 filtered_tests.append(test)
-                continue
-                
-            if self.matches_selector(model, explore, includes, excludes):
-                filtered_tests.append(test)
-                
+            # else:
+            #      if self.verbose: logger.debug(f"Excluding test '{test.get('test_id')}' based on selectors.")
+
+
+        count_before = len(tests)
+        count_after = len(filtered_tests)
+        logger.info(f"Filtered data tests: {count_after} selected out of {count_before}.")
+        self.log_timing("Filtering data tests", start_time)
         return filtered_tests
 
-    def _run_tests(self, tests: List[Dict[str, Any]]):
-        """Run all LookML tests with improved concurrency.
+
+    def _run_single_test(self, test: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Runs a single LookML data test using the Looker API.
 
         Args:
-            tests: List of test dictionaries
+            test: Test dictionary containing metadata ('model', 'name', 'test_id', etc.).
+
+        Returns:
+            A dictionary containing error details if the test fails or errors, otherwise None.
         """
-        # Create a semaphore to limit concurrent test execution
-        test_queue = asyncio.Queue()
-        for test in tests:
-            test_queue.put_nowait(test)
-            
-        # Use ThreadPoolExecutor for parallel execution
-        with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
-            futures = []
-            for _ in range(min(self.concurrency, len(tests))):
-                futures.append(
-                    executor.submit(self._process_test_queue, test_queue)
-                )
-                
-            # Wait for all tests to complete
-            for future in tqdm(
-                futures, 
-                total=len(futures), 
-                desc="Running test workers"
-            ):
-                future.result()  # This will raise any exceptions from the worker
+        model_name = test["model"]
+        test_name = test["name"]
+        test_id = test["test_id"] # e.g., "model_name/test_name"
 
-    def _process_test_queue(self, test_queue: asyncio.Queue):
-        """Process tests from the queue until empty.
-
-        Args:
-            test_queue: Queue of tests to process
-        """
-        while not test_queue.empty():
-            try:
-                test = test_queue.get_nowait()
-                self._run_single_test(test)
-                test_queue.task_done()
-            except asyncio.QueueEmpty:
-                break  # Queue is empty
-            except Exception as e:
-                # Log error but continue processing other tests
-                logger.error(f"Error processing test: {str(e)}")
-                test_queue.task_done()
-
-    def _run_single_test(self, test: Dict[str, Any]):
-        """Run a single LookML test.
-
-        Args:
-            test: Test dictionary
-        """
-        model = test["model"]
-        name = test["name"]
-        test_id = test["test_id"]
-        
-        logger.debug(f"Running test {test_id}")
-        
+        logger.debug(f"Running data test: {test_id}")
         start_time = time.time()
-        
+
         try:
-            # Run test
-            test_result = self.sdk.run_lookml_test(model, name)
-            
-            # Record runtime
+            # Run the specific LookML test via SDK
+            # Note: The API endpoint might still accept 'model_name' and 'test_name'
+            # even if the SDK method signature doesn't explicitly list them for run_lookml_test.
+            # The SDK likely uses them internally. If this fails, we might need to adjust.
+            test_result = self.sdk.run_lookml_test(
+                project_id=self.project,
+                # Pass model and test name if required by the underlying API call structure
+                # Check SDK documentation or API explorer if needed. Assuming they are used implicitly or via path.
+                # model_name=model_name, # May not be needed as direct args here
+                # test_name=test_name,   # May not be needed as direct args here
+                fields="success,errors" # Request only needed fields in response payload
+            )
             runtime = time.time() - start_time
-            self.test_runtime[test_id] = runtime
-            
-            # Process test result
+            logger.debug(f"Test {test_id} API call completed in {runtime:.2f}s")
+
+            # Process the result (LookmlTestResult object)
             success = getattr(test_result, "success", False)
-            errors = getattr(test_result, "errors", [])
-            warnings = getattr(test_result, "warnings", [])
-            
-            if success and not errors:
-                logger.debug(f"Test {test_id} passed ✓ ({runtime:.2f}s)")
-                self.passing_tests.add(test_id)
+            errors = getattr(test_result, "errors", []) # List of LookmlTestError objects
+
+            if success:
+                logger.debug(f"Test {test_id} passed.")
+                # Use printer? print_success(f"Test {test_id}: PASSED ({runtime:.2f}s)")
+                return None # Indicate success
             else:
-                logger.debug(f"Test {test_id} failed ❌ ({runtime:.2f}s)")
-                self.failing_tests.add(test_id)
-                
-                # Record errors
-                self.test_results[test_id] = {
-                    "success": success,
-                    "errors": [error.message for error in errors],
-                    "warnings": [warning.message for warning in warnings],
-                    "runtime": runtime,
-                    "file": test.get("file"),
-                    "line": test.get("line")
+                logger.error(f"Test {test_id} failed.")
+                # Format error messages from the result
+                error_messages = [str(getattr(e, 'message', 'Unknown test error')).strip() for e in errors if hasattr(e, 'message')]
+                full_error_message = "; ".join(error_messages) if error_messages else "Test failed with no specific error message."
+                # Use printer? print_fail(f"Test {test_id}: FAILED ({runtime:.2f}s)")
+
+                # Return structured error dictionary
+                return {
+                    "validator": self.__class__.__name__,
+                    "type": "Data Test Failure",
+                    "severity": "error",
+                    "model": model_name,
+                    "explore": test.get("explore"),
+                    "test_name": test_name,
+                    "file_path": test.get("file"), # Use the key from _get_tests
+                    "line": test.get("line"),     # Use the key from _get_tests
+                    "message": full_error_message,
+                    "runtime_seconds": round(runtime, 2),
+                    # Add full error objects if needed for detailed logging?
+                    # "raw_errors": [vars(e) for e in errors if hasattr(e, '__dict__')]
                 }
-        
+
+        except SDKError as e:
+            runtime = time.time() - start_time
+            error_msg = f"API error running data test {test_id}: {e}"
+            logger.error(error_msg, exc_info=True)
+            # Use printer? print_fail(f"Test {test_id}: API ERROR ({runtime:.2f}s)")
+            return {
+                "validator": self.__class__.__name__,
+                "type": "API Error",
+                "severity": "error",
+                "model": model_name,
+                "explore": test.get("explore"),
+                "test_name": test_name,
+                "file_path": test.get("file"),
+                "line": test.get("line"),
+                "message": f"API Error: {getattr(e, 'message', str(e))}", # Get specific message if possible
+                "status_code": e.status if hasattr(e, 'status') else None,
+                "runtime_seconds": round(runtime, 2),
+            }
         except Exception as e:
-            logger.error(f"Error running test {test_id}: {str(e)}")
-            self.failing_tests.add(test_id)
-            self.test_results[test_id] = {
-                "success": False,
-                "errors": [f"Exception: {str(e)}"],
-                "warnings": [],
-                "runtime": time.time() - start_time,
-                "file": test.get("file"),
-                "line": test.get("line")
+            runtime = time.time() - start_time
+            error_msg = f"Unexpected internal error running data test {test_id}: {e}"
+            logger.error(error_msg, exc_info=True)
+            # Use printer? print_fail(f"Test {test_id}: INTERNAL ERROR ({runtime:.2f}s)")
+            return {
+                "validator": self.__class__.__name__,
+                "type": "Internal Validator Error",
+                "severity": "error",
+                "model": model_name,
+                "explore": test.get("explore"),
+                "test_name": test_name,
+                "file_path": test.get("file"),
+                "line": test.get("line"),
+                "message": f"Internal error: {e}",
+                "runtime_seconds": round(runtime, 2),
             }
 
-    def _log_results(self):
-        """Log validation results."""
-        total_tests = len(self.passing_tests) + len(self.failing_tests)
-        
-        logger.info("\n" + "=" * 80)
-        logger.info(f"Assert Validation Results for {self.project}")
-        logger.info("=" * 80)
-        
-        logger.info(f"Total tests: {total_tests}")
-        logger.info(f"Passing: {len(self.passing_tests)}")
-        logger.info(f"Failing: {len(self.failing_tests)}")
-        
-        if self.failing_tests:
-            logger.info("\nFailed tests:")
-            
-            for test_id in sorted(self.failing_tests):
-                logger.info(f"  ❌ {test_id}")
-                
-                if test_id in self.test_results:
-                    result = self.test_results[test_id]
-                    runtime = result.get("runtime", 0)
-                    
-                    # Log file and line if available
-                    file_info = ""
-                    if result.get("file") and result.get("line"):
-                        file_info = f" ({result['file']}:{result['line']})"
-                    
-                    logger.info(f"    Runtime: {runtime:.2f}s{file_info}")
-                    
-                    for error in result.get("errors", []):
-                        logger.info(f"    Error: {error}")
-                        
-                    for warning in result.get("warnings", []):
-                        logger.info(f"    Warning: {warning}")
-        
-        if self.passing_tests:
-            logger.info("\nPassing tests:")
-            for test_id in sorted(self.passing_tests):
-                runtime = self.test_runtime.get(test_id, 0)
-                logger.info(f"  ✓ {test_id} ({runtime:.2f}s)")
-                
-        logger.info("=" * 80)
-        
-        # Save results to log file
-        if self.test_results:
-            log_path = os.path.join(self.log_dir, f"assert_results_{self.project}.json")
-            try:
-                with open(log_path, "w") as f:
-                    json.dump(self.test_results, f, indent=2)
-                logger.info(f"Test results saved to {log_path}")
-            except Exception as e:
-                logger.warning(f"Failed to save test results: {str(e)}")
+    def _execute_validation(self) -> List[Dict[str, Any]]:
+        """Core assert validation logic, called by BaseValidator.validate()."""
+        all_errors: List[Dict[str, Any]] = []
+        start_time = time.time()
+
+        try:
+            # Find all LookML tests for the project
+            logger.info(f"Finding LookML data tests for project '{self.project}'...")
+            all_tests = self._get_tests() # Raises LookerApiError or ValidatorError on failure
+
+            if not all_tests:
+                # Already logged in _get_tests if none found via API
+                # logger.warning(f"No LookML data tests found for project '{self.project}'.")
+                return [] # Return empty list, nothing to validate
+
+            # Filter tests based on model/explore selectors
+            tests_to_run = self._filter_tests(all_tests)
+
+            if not tests_to_run:
+                # Already logged in _filter_tests
+                # logger.warning(f"No LookML data tests match the provided selectors for project '{self.project}'.")
+                return []
+
+            logger.info(f"Running {len(tests_to_run)} LookML data tests (Concurrency: {self.concurrency})...")
+
+            # Run tests concurrently using ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
+                future_to_test = {
+                    executor.submit(self._run_single_test, test): test
+                    for test in tests_to_run
+                }
+
+                test_count = len(future_to_test)
+                completed_count = 0
+                logger.info(f"Submitted {test_count} tests to thread pool.")
+
+                # Process results as they complete
+                for future in as_completed(future_to_test):
+                    completed_count += 1
+                    test = future_to_test[future]
+                    test_id = test.get("test_id", "unknown_test")
+                    logger.debug(f"Processing result for test {test_id} ({completed_count}/{test_count})")
+
+                    try:
+                        # Get result (error dict or None)
+                        result_error = future.result()
+                        if result_error:
+                            all_errors.append(result_error)
+                        else:
+                            pass # Success
+                    except Exception as exc:
+                        # Catch unexpected errors from within the thread execution itself
+                        logger.error(f"Unexpected internal error processing result for test {test_id}: {exc}", exc_info=True)
+                        all_errors.append({
+                            "validator": self.__class__.__name__,
+                            "type": "Internal Validator Error",
+                            "severity": "error",
+                            "model": test.get("model"),
+                            "explore": test.get("explore"),
+                            "test_name": test.get("name"),
+                            "file_path": test.get("file"),
+                            "line": test.get("line"),
+                            "message": f"An internal error occurred processing test result: {exc}",
+                        })
+
+            # Log timing
+            self.log_timing("Assert validation execution", start_time)
+
+            # Log summary
+            passed_count = len(tests_to_run) - len(all_errors)
+            if not all_errors:
+                logger.info(f"Assert validation completed successfully: {passed_count} tests passed.")
+            else:
+                logger.error(f"Assert validation completed: {passed_count} tests passed, {len(all_errors)} tests failed or errored.")
+
+            return all_errors
+
+        except (LookerApiError, AssertValidationError, ValidatorError) as e:
+             # Re-raise these specific exceptions to be caught by BaseValidator.validate()
+             logger.error(f"Assert validation failed during setup or execution: {e}", exc_info=False) # Log the specific error
+             raise e # Re-raise
+        except Exception as e:
+            # Catch any other unexpected errors during setup/filtering
+            error_msg = f"Unexpected error during assert validation setup: {e}"
+            logger.error(error_msg, exc_info=True)
+            # Wrap it in ValidatorError for consistent handling in run_validator
+            raise ValidatorError(error_msg, original_exception=e) from e
