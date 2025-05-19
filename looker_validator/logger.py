@@ -1,163 +1,177 @@
 """
-Logging configuration for Looker Validator.
+Enhanced logging configuration for looker-validator.
 """
 
-import os
 import logging
-import logging.handlers
+import os
+import sys
+from pathlib import Path
 from typing import Optional
+
+import colorama
+
+# Initialize colorama for cross-platform color support
+colorama.init()
+
+# Define color constants
+COLORS = {
+    "red": colorama.Fore.RED,
+    "green": colorama.Fore.GREEN,
+    "yellow": colorama.Fore.YELLOW,
+    "cyan": colorama.Fore.CYAN,
+    "blue": colorama.Fore.BLUE,
+    "magenta": colorama.Fore.MAGENTA,
+    "white": colorama.Fore.WHITE,
+    "bold": colorama.Style.BRIGHT,
+    "dim": colorama.Style.DIM,
+    "reset": colorama.Style.RESET_ALL,
+}
+
+LOG_FILENAME = "looker_validator.log"
+
+
+class ColoredFormatter(logging.Formatter):
+    """Formatter that adds colors to log messages."""
+    
+    COLORS = {
+        "DEBUG": COLORS["blue"],
+        "INFO": COLORS["green"],
+        "WARNING": COLORS["yellow"],
+        "ERROR": COLORS["red"],
+        "CRITICAL": COLORS["red"] + COLORS["bold"]
+    }
+    
+    def format(self, record: logging.LogRecord) -> str:
+        """Format the record with colors."""
+        # Skip colors if NO_COLOR is set
+        if os.environ.get('NO_COLOR') or os.environ.get('TERM') == 'dumb':
+            return super().format(record)
+        
+        # Add color based on log level
+        levelname = record.levelname
+        color = self.COLORS.get(levelname, '')
+        
+        # Format the message
+        message = super().format(record)
+        
+        # Add color to the message
+        if color:
+            reset = COLORS["reset"]
+            message = f"{color}{message}{reset}"
+        
+        return message
+
+
+class FileFormatter(logging.Formatter):
+    """Formatter for file logs without color codes."""
+    
+    def format(self, record: logging.LogRecord) -> str:
+        """Format the record without colors."""
+        message = super().format(record)
+        return self._strip_color_codes(message)
+    
+    def _strip_color_codes(self, text: str) -> str:
+        """Remove ANSI color codes from text."""
+        for escape_sequence in COLORS.values():
+            text = text.replace(escape_sequence, "")
+        return text
 
 
 def setup_logger(
     name: str = "looker_validator",
-    log_dir: str = "logs",
-    verbose: bool = False
+    level: int = logging.INFO,
+    log_dir: Optional[str] = None
 ) -> logging.Logger:
     """Set up a logger with console and file handlers.
-
+    
     Args:
-        name: Name of the logger
+        name: Logger name
+        level: Logging level
         log_dir: Directory for log files
-        verbose: Whether to enable verbose logging
-
+        
     Returns:
-        Configured logger instance
+        Configured logger
     """
     # Create logger
     logger = logging.getLogger(name)
+    logger.setLevel(level)
     
-    # Skip if already configured
-    if logger.handlers:
-        return logger
+    # Remove any existing handlers
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
     
-    # Set level based on verbose flag
-    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    # Create console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(ColoredFormatter("%(message)s"))
+    console_handler.setLevel(level)
+    logger.addHandler(console_handler)
     
-    # Create formatters
-    console_formatter = logging.Formatter(
-        "%(message)s"
-    )
-    file_formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
-    
-    # Console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(console_formatter)
-    console_handler.setLevel(logging.INFO)  # Always INFO for console
-    
-    # File handler
-    try:
-        os.makedirs(log_dir, exist_ok=True)
-        file_handler = logging.handlers.RotatingFileHandler(
-            os.path.join(log_dir, f"{name}.log"),
-            maxBytes=10 * 1024 * 1024,  # 10 MB
-            backupCount=5
-        )
-        file_handler.setFormatter(file_formatter)
-        file_handler.setLevel(logging.DEBUG)  # Always DEBUG for file
+    # Create file handler if log_dir is provided
+    if log_dir:
+        log_dir_path = Path(log_dir)
+        log_dir_path.mkdir(exist_ok=True)
         
-        # Add handlers to logger
-        logger.addHandler(console_handler)
+        # Create subfolder for SQL query logs
+        (log_dir_path / "queries").mkdir(exist_ok=True)
+        
+        file_handler = logging.FileHandler(
+            log_dir_path / LOG_FILENAME,
+            encoding="utf-8"
+        )
+        file_handler.setFormatter(
+            FileFormatter("%(asctime)s %(levelname)s | %(message)s")
+        )
+        file_handler.setLevel(logging.DEBUG)  # Always log DEBUG to file
         logger.addHandler(file_handler)
-    except Exception as e:
-        # If file logging fails, just use console
-        console_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
-        logger.addHandler(console_handler)
-        logger.warning(f"Failed to set up file logging: {str(e)}")
     
     return logger
 
 
-def get_colored_logger(log_dir: str = "logs", verbose: bool = False) -> logging.Logger:
-    """Get a logger with colored output for the console.
-
+def get_logger(name: str = "looker_validator") -> logging.Logger:
+    """Get an existing logger.
+    
     Args:
-        log_dir: Directory for log files
-        verbose: Whether to enable verbose logging
-
+        name: Logger name
+        
     Returns:
-        Configured logger instance with colored console output
+        Logger instance
     """
-    try:
-        # Try to import colorama for cross-platform color support
-        from colorama import init, Fore, Style
-        init()
+    return logging.getLogger(name)
+
+
+def log_sql_error(
+    model: str,
+    explore: str,
+    sql: str,
+    log_dir: str,
+    dimension: Optional[str] = None
+) -> Path:
+    """Save failing SQL to a file.
+    
+    Args:
+        model: Model name
+        explore: Explore name
+        sql: SQL to save
+        log_dir: Directory for logs
+        dimension: Optional dimension name
         
-        class ColoredFormatter(logging.Formatter):
-            """Custom formatter for colored console output."""
-            
-            COLORS = {
-                'DEBUG': Fore.BLUE,
-                'INFO': Fore.GREEN,
-                'WARNING': Fore.YELLOW,
-                'ERROR': Fore.RED,
-                'CRITICAL': Fore.RED + Style.BRIGHT
-            }
-            
-            def format(self, record):
-                """Format the record with colors."""
-                # Check if NO_COLOR environment variable is set
-                if os.environ.get('NO_COLOR'):
-                    return super().format(record)
-                
-                # Add color based on log level
-                levelname = record.levelname
-                color = self.COLORS.get(levelname, '')
-                
-                # Format the message
-                message = super().format(record)
-                
-                # Add color to the message
-                if color:
-                    reset = Style.RESET_ALL
-                    message = f"{color}{message}{reset}"
-                
-                return message
-        
-        # Create logger
-        logger = logging.getLogger("looker_validator")
-        
-        # Skip if already configured
-        if logger.handlers:
-            return logger
-        
-        # Set level based on verbose flag
-        logger.setLevel(logging.DEBUG if verbose else logging.INFO)
-        
-        # Create formatters
-        console_formatter = ColoredFormatter("%(message)s")
-        file_formatter = logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        )
-        
-        # Console handler
-        console_handler = logging.StreamHandler()
-        console_handler.setFormatter(console_formatter)
-        console_handler.setLevel(logging.INFO)  # Always INFO for console
-        
-        # File handler
-        try:
-            os.makedirs(log_dir, exist_ok=True)
-            file_handler = logging.handlers.RotatingFileHandler(
-                os.path.join(log_dir, "looker_validator.log"),
-                maxBytes=10 * 1024 * 1024,  # 10 MB
-                backupCount=5
-            )
-            file_handler.setFormatter(file_formatter)
-            file_handler.setLevel(logging.DEBUG)  # Always DEBUG for file
-            
-            # Add handlers to logger
-            logger.addHandler(console_handler)
-            logger.addHandler(file_handler)
-        except Exception as e:
-            # If file logging fails, just use console
-            console_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
-            logger.addHandler(console_handler)
-            logger.warning(f"Failed to set up file logging: {str(e)}")
-        
-        return logger
-        
-    except ImportError:
-        # Fall back to regular logger if colorama isn't available
-        return setup_logger(log_dir=log_dir, verbose=verbose)
+    Returns:
+        Path to the SQL file
+    """
+    # Create a filename based on the model/explore/dimension
+    file_name = f"{model}__{explore}"
+    if dimension:
+        file_name += f"__{dimension}"
+    file_name = file_name.replace(".", "_") + ".sql"
+    
+    # Create the file path
+    file_path = Path(log_dir) / "queries" / file_name
+    
+    # Create directory if it doesn't exist
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    
+    # Write SQL to file
+    with open(file_path, "w") as f:
+        f.write(sql)
+    
+    return file_path

@@ -1,383 +1,402 @@
 """
-LookML validator for testing LookML syntax.
+Asynchronous LookML validator for syntax checking.
 """
 
 import logging
-import os
 import time
-import json
-from typing import List, Dict, Any, Optional, Tuple, Set
-import requests
+from typing import Dict, List, Optional, Any, Set, cast
 
-from looker_validator.validators.base import BaseValidator, ValidatorError
+from looker_validator.async_client import AsyncLookerClient, LOOKML_VALIDATION_TIMEOUT
+from looker_validator.exceptions import LookMLValidationError
+from looker_validator.result_model import LookMLError, ValidationResult, TestResult, SkipReason
+from looker_validator.validators.base_validator import AsyncBaseValidator
 
 logger = logging.getLogger(__name__)
 
+# Define severity levels
+SEVERITY_LEVELS = {
+    "success": 0,
+    "info": 10,
+    "warning": 20,
+    "error": 30,
+    "fatal": 40
+}
 
-class LookMLValidator(BaseValidator):
+
+class AsyncLookMLValidator(AsyncBaseValidator):
     """Validator for testing LookML syntax."""
-
-    def __init__(self, connection, project, **kwargs):
-        """Initialize LookML validator.
-
-        Args:
-            connection: LookerConnection instance
-            project: Looker project name
-            **kwargs: Additional validator options
-        """
-        super().__init__(connection, project, **kwargs)
-        self.severity = kwargs.get("severity", "warning")
+    
+    def __init__(
+        self,
+        client: AsyncLookerClient,
+        project: str,
+        branch: Optional[str] = None,
+        commit_ref: Optional[str] = None,
+        remote_reset: bool = False,
+        severity: str = "warning",
+        log_dir: str = "logs",
+        pin_imports: Optional[Dict[str, str]] = None,
+        use_personal_branch: bool = False,
+        timeout: int = LOOKML_VALIDATION_TIMEOUT,
+        incremental: bool = False,
+        target: Optional[str] = None,
+    ):
+        """Initialize the LookML validator.
         
-        # Validation results
-        self.issues = []
-
-    def validate(self) -> bool:
+        Args:
+            client: AsyncLookerClient instance
+            project: Looker project name
+            branch: Git branch name
+            commit_ref: Git reference to base branch on
+            remote_reset: Whether to reset to remote branch state
+            severity: Minimum severity level to trigger failure
+            log_dir: Directory for logs
+            pin_imports: Dictionary of project:ref pairs for imports
+            use_personal_branch: Whether to use personal branch
+            timeout: Timeout for validation in seconds
+            incremental: Whether to perform incremental validation
+            target: Target branch for incremental comparison
+        """
+        super().__init__(
+            client, 
+            project, 
+            branch,
+            commit_ref,
+            remote_reset,
+            None,  # explore selectors not used for LookML validation
+            log_dir,
+            pin_imports,
+            use_personal_branch
+        )
+        
+        self.severity = severity
+        self.timeout = timeout
+        self.incremental = incremental
+        self.target = target
+    
+    async def validate(self) -> ValidationResult:
         """Run LookML validation.
-
+        
         Returns:
-            True if LookML syntax is valid, False otherwise
+            ValidationResult with the validation results
         """
         start_time = time.time()
+        result = ValidationResult(validator="lookml", status="passed")
         
         try:
             # Set up branch for validation
-            self.setup_branch()
+            await self.setup_branch()
             
-            # Pin imported projects if specified
-            if self.pin_imports:
-                self.pin_imported_projects()
-            
-            # Run LookML validator
-            logger.info(f"Running LookML validator for project {self.project}")
-            
-            # Try validation with timeout handling
-            try:
-                # First try to get cached validation results
-                try:
-                    cache_result = self._get_cached_validation()
-                    if cache_result and not cache_result.get("stale", False):
-                        logger.info("Using cached LookML validation results")
-                        self._process_validation_response(cache_result)
-                    else:
-                        logger.info("No valid cached results found, running full validation")
-                        self._validate_lookml()
-                except (requests.exceptions.Timeout, Exception) as e:
-                    logger.info(f"Couldn't get cached results: {str(e)}, running full validation")
-                    self._validate_lookml()
-            except requests.exceptions.Timeout:
-                logger.warning(f"LookML validation timed out for project {self.project}. The project may be too large.")
-                self.issues.append({
-                    "severity": "error",
-                    "message": "Validation request timed out. Your project may be too large for validation.",
-                    "file_path": "",
-                    "line_number": 0
-                })
-            except Exception as e:
-                logger.error(f"Failed to validate LookML: {str(e)}")
-                self.issues.append({
-                    "severity": "error",
-                    "message": f"Validation failed: {str(e)}",
-                    "file_path": "",
-                    "line_number": 0
-                })
-            
-            # Log results
-            self._log_results()
-            
-            self.log_timing("LookML validation", start_time)
-            
-            # Return True if no issues of specified severity or higher
-            return self._check_severity()
-        
-        finally:
-            # Clean up temporary branch if needed
-            self.cleanup()
-
-    def _get_cached_validation(self) -> Optional[Dict[str, Any]]:
-        """Get cached LookML validation results."""
-        logger.debug(f"Checking for cached LookML validation results for project '{self.project}'")
-        try:
-            # This endpoint path may need to be adjusted based on your Looker API version
-            url = f"projects/{self.project}/validate"
-            response = self.sdk.get(url)
-            
-            # Check if we got a valid response
-            if response.status_code == 204:  # No content typically means no cached results
-                return None
+            # Skip cache check when validating a specific branch
+            if self.branch:
+                logger.debug(f"Running fresh validation on branch '{self.branch}'")
+                validation_results = await self.client.lookml_validation(
+                    self.project, 
+                    self.timeout
+                )
+            else:
+                # Check for cached validation results only for production
+                logger.debug("Checking for cached LookML validation results")
+                validation_results = await self.client.cached_lookml_validation(self.project)
                 
-            return response.json()
+                # Run validation if no cached results or cache is stale
+                if not validation_results or validation_results.get("stale", False):
+                    logger.debug("No valid cached results, running full validation")
+                    validation_results = await self.client.lookml_validation(
+                        self.project, 
+                        self.timeout
+                    )
+                else:
+                    logger.debug("Using cached LookML validation results")
+            
+            # Get all models and explores in the project for tracking what was tested
+            models_explores = await self._get_lookml_models_explores()
+            
+            # If incremental mode, filter to only modified explores
+            if self.incremental and (self.branch or self.commit_ref):
+                logger.info(f"Running in incremental mode, comparing to {self.target or 'production'}")
+                target_models_explores = await self._get_target_models_explores()
+                modified_models_explores = self._get_modified_explores(models_explores, target_models_explores)
+                
+                logger.info(f"Found {self._count_explores(modified_models_explores)} explores modified from target")
+                models_explores = modified_models_explores
+            
+            # Process validation results
+            await self._process_validation_results(validation_results, result, models_explores)
+            
+            # Add timing information
+            result.timing["total"] = time.time() - start_time
+            
+            return result
+            
         except Exception as e:
-            logger.debug(f"Error getting cached validation results: {str(e)}")
-            return None
-
-    def _validate_lookml(self):
-        """Run LookML validation."""
-        try:
-            # Use Looker's LookML validator without timeout parameter
-            response = self.sdk.validate_project(self.project)
-            
-            # Process the validation response
-            self._process_validation_response(response)
-            
-        except requests.exceptions.Timeout:
-            # Re-raise timeout errors for special handling
-            raise
-        except Exception as e:
-            logger.error(f"Failed to validate LookML: {str(e)}")
-            raise ValidatorError(f"LookML validation failed: {str(e)}")
-
-    def _process_validation_response(self, response):
-        """Process the validation response from the API.
-        
-        This method handles different API versions and response structures.
-        """
-        try:
-            # Check for API 4.0 validation results - empty errors list means no issues
-            if hasattr(response, 'errors'):
-                if not response.errors:
-                    logger.info("LookML validation passed with no issues (empty errors list)")
-                    self.issues.append({
-                        "severity": "info",
-                        "message": "LookML validation successful - no errors found",
-                        "file_path": "",
-                        "line_number": 0
-                    })
-                    return
-                    
-                # Process errors if they exist
-                for error in response.errors:
-                    self.issues.append({
-                        "severity": "error",
-                        "message": self._get_attr(error, 'message', ''),
-                        "file_path": self._get_attr(error, 'file_path', '') or self._get_attr(error, 'model_name', ''),
-                        "line_number": self._get_attr(error, 'line_number', 0)
-                    })
-            
-            # Check for 'validation_errors' in API 4.0
-            if hasattr(response, 'validation_errors') and response.validation_errors:
-                for err in response.validation_errors:
-                    severity = self._get_attr(err, 'severity', 'error').lower()
-                    message = self._get_attr(err, 'message', '')
-                    file_path = self._get_attr(err, 'file_path', '') or self._get_attr(err, 'model_name', '')
-                    line_number = self._get_attr(err, 'line_number', 0)
-                    
-                    self.issues.append({
-                        "severity": severity,
-                        "message": message,
-                        "file_path": file_path,
-                        "line_number": line_number
-                    })
-            
-            # Check if the response has a direct structure for project errors
-            if hasattr(response, 'project_error') and response.project_error:
-                self.issues.append({
-                    "severity": "error",
-                    "message": str(response.project_error),
-                    "file_path": "",
-                    "line_number": 0
-                })
-            
-            # Check if the response has a direct structure for model errors
-            if hasattr(response, 'model_error') and response.model_error:
-                self.issues.append({
-                    "severity": "error",
-                    "message": str(response.model_error),
-                    "file_path": "",
-                    "line_number": 0
-                })
-            
-            # Check if there are models that weren't validated
-            if hasattr(response, 'models_not_validated') and response.models_not_validated:
-                for model in response.models_not_validated:
-                    self.issues.append({
-                        "severity": "warning",
-                        "message": f"Model '{model}' was not validated",
-                        "file_path": "",
-                        "line_number": 0
-                    })
-                
-            # Check for computation time - log it for information
-            if hasattr(response, 'computation_time'):
-                logger.info(f"LookML validation computation time: {response.computation_time} seconds")
-                
-            # If the response has 'is_valid' attribute and it's True, no issues
-            if hasattr(response, 'is_valid') and response.is_valid:
-                logger.info("LookML validation passed with no issues")
-                # Explicitly add an info message indicating success
-                self.issues.append({
-                    "severity": "info",
-                    "message": "LookML validation successful - no issues found",
-                    "file_path": "",
-                    "line_number": 0
-                })
-                return
-            
-            # Check for project_digest - indicates successful validation
-            if hasattr(response, 'project_digest') and response.project_digest:
-                # If we have a project digest and no errors, it's likely valid
-                if not self.issues or all(issue["severity"] == "info" for issue in self.issues):
-                    logger.info("LookML validation passed (project digest exists)")
-                    self.issues.append({
-                        "severity": "info",
-                        "message": "LookML validation successful - project digest exists",
-                        "file_path": "",
-                        "line_number": 0
-                    })
-                    return
-            
-            # If no issues were found but response wasn't explicitly marked valid,
-            # it might be a different response structure
-            if not self.issues:
-                # Try to introspect the response
-                if hasattr(response, "__dict__"):
-                    # Check each attribute for potential errors
-                    for attr_name, attr_value in response.__dict__.items():
-                        # Skip internal attributes
-                        if attr_name.startswith("_"):
-                            continue
-                            
-                        # If attribute is a list, it might contain errors
-                        if isinstance(attr_value, list) and attr_value:
-                            logger.debug(f"Found list in response: {attr_name}")
-                            # Determine severity from attribute name
-                            severity = "error"
-                            if "warning" in attr_name.lower():
-                                severity = "warning"
-                            elif "info" in attr_name.lower():
-                                severity = "info"
-                                
-                            # Process items in the list
-                            for item in attr_value:
-                                # If item is a complex object with attributes
-                                if hasattr(item, "__dict__"):
-                                    item_dict = item.__dict__
-                                    self.issues.append({
-                                        "severity": severity,
-                                        "message": item_dict.get("message", str(item)),
-                                        "file_path": item_dict.get("file_path", "") or item_dict.get("model_name", ""),
-                                        "line_number": item_dict.get("line_number", 0)
-                                    })
-                                # If item is a simple value
-                                else:
-                                    self.issues.append({
-                                        "severity": severity,
-                                        "message": str(item),
-                                        "file_path": "",
-                                        "line_number": 0
-                                    })
-                
-                # Last resort - if we still don't have any issues
-                if not self.issues:
-                    # Empty errors list but no success indicator - assume success
-                    logger.info("No validation issues detected (empty API response)")
-                    self.issues.append({
-                        "severity": "info",
-                        "message": "LookML validation completed with no detected issues",
-                        "file_path": "",
-                        "line_number": 0
-                    })
-                        
-        except Exception as e:
-            logger.error(f"Failed to process validation response: {str(e)}")
-            # Add the error as an issue
-            self.issues.append({
-                "severity": "error",
-                "message": f"Failed to process validation response: {str(e)}",
-                "file_path": "",
-                "line_number": 0
-            })
-
-    def _get_attr(self, obj, attr_name, default_value):
-        """Safely get an attribute from an object, returning a default if not present."""
-        try:
-            if hasattr(obj, attr_name):
-                return getattr(obj, attr_name)
-            elif hasattr(obj, '__dict__') and attr_name in obj.__dict__:
-                return obj.__dict__[attr_name]
-            elif isinstance(obj, dict) and attr_name in obj:
-                return obj[attr_name]
-            return default_value
-        except:
-            return default_value
-
-    def _check_severity(self) -> bool:
-        """Check if there are issues of the specified severity or higher.
-
-        Returns:
-            True if no issues of specified severity or higher
-        """
-        severity_levels = {
-            "info": 0,
-            "warning": 1,
-            "error": 2
-        }
-        
-        min_severity = severity_levels.get(self.severity, 1)
-        
-        for issue in self.issues:
-            issue_severity = severity_levels.get(issue["severity"], 0)
-            if issue_severity >= min_severity:
-                # Don't fail on timeout unless severity is error
-                if "timeout" in issue["message"].lower() and min_severity < 2:
-                    logger.warning("Timeout detected but continuing due to severity threshold")
-                    continue
-                return False
-                
-        return True
-
-    def _log_results(self):
-        """Log validation results."""
-        total_issues = len(self.issues)
-        info_count = sum(1 for issue in self.issues if issue["severity"] == "info")
-        warning_count = sum(1 for issue in self.issues if issue["severity"] == "warning")
-        error_count = sum(1 for issue in self.issues if issue["severity"] == "error")
-        
-        logger.info("\n" + "=" * 80)
-        logger.info(f"LookML Validation Results for {self.project}")
-        logger.info("=" * 80)
-        
-        logger.info(f"Total issues: {total_issues}")
-        logger.info(f"Errors: {error_count}")
-        logger.info(f"Warnings: {warning_count}")
-        logger.info(f"Info: {info_count}")
-        logger.info(f"Severity threshold: {self.severity}")
-        
-        if self.issues:
-            logger.info("\nIssues:")
-            
-            # Sort issues by severity (error, warning, info)
-            severity_order = {"error": 0, "warning": 1, "info": 2}
-            sorted_issues = sorted(
-                self.issues,
-                key=lambda x: (severity_order.get(x["severity"], 3), x["file_path"] or "", x["line_number"] or 0)
+            logger.error(f"LookML validation failed: {str(e)}")
+            raise LookMLValidationError(
+                title="LookML validation failed",
+                detail=f"Failed to validate LookML: {str(e)}"
             )
             
-            for issue in sorted_issues:
-                severity = issue["severity"].upper()
-                message = issue["message"]
-                file_path = issue["file_path"] or "Unknown file"
-                line_number = issue["line_number"] or "Unknown line"
-                
-                # Format by severity
-                if severity == "ERROR":
-                    prefix = "❌"
-                elif severity == "WARNING":
-                    prefix = "⚠️"
-                else:
-                    prefix = "ℹ️"
-                
-                logger.info(f"  {prefix} {severity}: {message}")
-                if file_path != "Unknown file" or line_number != "Unknown line":
-                    logger.info(f"     at {file_path}:{line_number}")
-                
-        logger.info("=" * 80)
+        finally:
+            # Clean up branch manager
+            await self.cleanup()
+    
+    def _count_explores(self, models_explores: Dict[str, List[str]]) -> int:
+        """Count the total number of explores in the dictionary.
         
-        # Save issues to log file
-        if self.issues:
-            log_path = os.path.join(self.log_dir, f"lookml_issues_{self.project}.json")
-            try:
-                with open(log_path, "w") as f:
-                    json.dump(self.issues, f, indent=2)
-                logger.info(f"Issue details saved to {log_path}")
-            except Exception as e:
-                logger.warning(f"Failed to save issue log: {str(e)}")
+        Args:
+            models_explores: Dictionary mapping model names to lists of explore names
+            
+        Returns:
+            Total number of explores
+        """
+        return sum(len(explores) for explores in models_explores.values())
+    
+    async def _get_lookml_models_explores(self) -> Dict[str, List[str]]:
+        """Get all models and explores in the project.
+        
+        Returns:
+            Dictionary mapping model names to lists of explore names
+        """
+        logger.debug(f"Getting LookML models and explores for project '{self.project}'")
+        
+        # Get all LookML models
+        models = await self.client.get_lookml_models(fields=["name", "project_name", "explores"])
+        
+        # Filter to models in this project
+        project_models = [model for model in models if model.get("project_name") == self.project]
+        
+        # Create model->explores mapping
+        models_explores = {}
+        for model in project_models:
+            model_name = model["name"]
+            explores = []
+            
+            for explore_data in model.get("explores", []):
+                explore_name = explore_data["name"]
+                explores.append(explore_name)
+            
+            if explores:
+                models_explores[model_name] = explores
+        
+        logger.debug(f"Found {len(models_explores)} models with {self._count_explores(models_explores)} explores")
+        return models_explores
+    
+    async def _get_target_models_explores(self) -> Dict[str, List[str]]:
+        """Get models and explores from the target branch/commit.
+        
+        Returns:
+            Dictionary mapping model names to lists of explore names
+        """
+        if not self.target and not self.branch and not self.commit_ref:
+            raise ValueError("Target, branch, or commit_ref must be specified for incremental validation")
+        
+        # Save current branch/commit
+        current_branch = self.branch
+        current_commit = self.commit_ref
+        
+        try:
+            # Set target branch (or production if not specified)
+            self.branch = self.target
+            self.commit_ref = None
+            
+            # Set up branch
+            await self.setup_branch()
+            
+            # Get models and explores on target branch
+            return await self._get_lookml_models_explores()
+            
+        finally:
+            # Restore original branch/commit
+            self.branch = current_branch
+            self.commit_ref = current_commit
+            
+            # Switch back
+            await self.setup_branch()
+    
+    def _get_modified_explores(
+        self, 
+        current_models_explores: Dict[str, List[str]], 
+        target_models_explores: Dict[str, List[str]]
+    ) -> Dict[str, List[str]]:
+        """Identify modified explores by comparing current and target branches.
+        
+        Args:
+            current_models_explores: Models and explores in current branch
+            target_models_explores: Models and explores in target branch
+            
+        Returns:
+            Dictionary containing only modified or new explores
+        """
+        modified_models_explores = {}
+        
+        # Check for new or modified models and explores
+        for model, explores in current_models_explores.items():
+            # If model doesn't exist in target, all explores are new
+            if model not in target_models_explores:
+                modified_models_explores[model] = explores
+                continue
+            
+            # Find explores that are new in this model
+            target_explores = set(target_models_explores[model])
+            modified_explores = [e for e in explores if e not in target_explores]
+            
+            if modified_explores:
+                modified_models_explores[model] = modified_explores
+        
+        return modified_models_explores
+    
+    async def _process_validation_results(
+        self, 
+        validation_results: Dict[str, Any], 
+        result: ValidationResult,
+        models_explores: Dict[str, List[str]]
+    ) -> None:
+        """Process LookML validation results.
+        
+        Args:
+            validation_results: Raw validation results from Looker API
+            result: ValidationResult object to update
+            models_explores: Dictionary mapping model names to lists of explore names
+        """
+        # Check for empty results
+        if not validation_results:
+            return
+        
+        # Get severity threshold
+        severity_threshold = SEVERITY_LEVELS.get(self.severity, SEVERITY_LEVELS["warning"])
+        
+        # Process errors
+        errors = validation_results.get("errors", [])
+        
+        # No errors means validation was successful
+        if not errors:
+            logger.info("LookML validation passed with no issues")
+        
+        # Track models/explores with errors for test results
+        model_explore_errors = {}
+        
+        # Process each error
+        has_error_over_threshold = False
+        for error in errors:
+            # Get error details
+            model_id = error.get("model_id", "")
+            explore = error.get("explore", "")
+            
+            # Skip errors for explores not in our filtered list
+            if (
+                models_explores and 
+                (model_id not in models_explores or 
+                 (explore and explore not in models_explores.get(model_id, [])))
+            ):
+                continue
+                
+            message = error.get("message", "Unknown error")
+            file_path = error.get("file_path", "")
+            line_number = error.get("line_number")
+            field_name = error.get("field_name", "")
+            severity = error.get("severity", "error").lower()
+            
+            # Create key for tracking errored explores
+            model_explore_key = f"{model_id}/{explore}"
+            if model_explore_key not in model_explore_errors:
+                model_explore_errors[model_explore_key] = []
+            
+            # Check for ignore tags
+            if self._has_ignore_tag(error):
+                logger.debug(f"Ignoring LookML error due to ignore tag: {message}")
+                continue
+            
+            # Create LookML URL if file_path is provided
+            lookml_url = None
+            if file_path:
+                lookml_url = f"{self.client.base_url}/projects/{self.project}/files/{'/'.join(file_path.split('/')[1:])}"
+                if line_number:
+                    lookml_url += f"?line={line_number}"
+            
+            # Create error object
+            lookml_error = LookMLError(
+                model=model_id,
+                explore=explore,
+                message=message,
+                field_name=field_name,
+                severity=severity,
+                file_path=file_path,
+                line_number=line_number,
+                lookml_url=lookml_url
+            )
+            
+            # Track error by model/explore
+            model_explore_errors[model_explore_key].append(lookml_error)
+            
+            # Add error to result
+            result.add_error(lookml_error)
+            
+            # Check if error is over threshold
+            error_severity = SEVERITY_LEVELS.get(severity, SEVERITY_LEVELS["error"])
+            if error_severity >= severity_threshold:
+                has_error_over_threshold = True
+        
+        # Add test results for all models and explores
+        test_results_added = set()
+        
+        # First add results for models/explores with errors
+        for model_explore, errors in model_explore_errors.items():
+            if "/" in model_explore:
+                model, explore = model_explore.split("/", 1)
+            else:
+                model = model_explore
+                explore = "unknown"
+            
+            test_result = TestResult(
+                model=model,
+                explore=explore,
+                status="failed" if has_error_over_threshold else "passed"
+            )
+            result.add_test_result(test_result)
+            test_results_added.add(model_explore)
+        
+        # Then add results for all other models/explores that were checked
+        for model, explores in models_explores.items():
+            for explore in explores:
+                model_explore = f"{model}/{explore}"
+                if model_explore not in test_results_added:
+                    test_result = TestResult(
+                        model=model,
+                        explore=explore,
+                        status="passed"
+                    )
+                    result.add_test_result(test_result)
+        
+        # Update overall status based on severity threshold
+        if has_error_over_threshold:
+            result.status = "failed"
+        else:
+            result.status = "passed"
+            
+    def _has_ignore_tag(self, error: Dict[str, Any]) -> bool:
+        """Check if an error has an ignore tag.
+        
+        Args:
+            error: Error data from the API
+            
+        Returns:
+            True if the error has an ignore tag
+        """
+        # Check for tags in error data
+        tags = error.get("tags", [])
+        for tag in tags:
+            tag_lower = tag.lower()
+            if "spectacles: ignore" in tag_lower or "looker-validator: ignore" in tag_lower:
+                return True
+                
+        # Check for comments in error message
+        message = error.get("message", "").lower()
+        if "-- spectacles: ignore" in message or "-- looker-validator: ignore" in message:
+            return True
+            
+        # Check field name for ignore suffix (some developers add it to field names)
+        field_name = error.get("field_name", "").lower()
+        if "spectacles_ignore" in field_name or "looker_validator_ignore" in field_name:
+            return True
+            
+        return False

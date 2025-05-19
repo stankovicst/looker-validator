@@ -23,6 +23,11 @@ setup(
         "tqdm>=4.65.0",
         "requests>=2.28.0",
         "colorama>=0.4.6",
+        "backoff>=2.2.1",
+        "aiohttp>=3.9.1",
+        "aiocache>=0.12.2",
+        "httpx>=0.25.2",
+        "pydantic>=2.5.2",
     ],
     extras_require={
         "dev": [
@@ -37,7 +42,7 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "looker-validator=looker_validator.cli:main",
+            "looker-validator=looker_validator.async_cli:main",
         ],
     },
     python_requires=">=3.8",
