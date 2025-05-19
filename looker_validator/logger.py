@@ -5,9 +5,10 @@ Simplified to focus *only* on file logging setup.
 Console level and output formatting are handled by cli.py and printer.py (Rich).
 """
 
-import os
 import logging
-import logging.handlers
+import os
+import sys
+from pathlib import Path
 from typing import Optional
 from pathlib import Path
 

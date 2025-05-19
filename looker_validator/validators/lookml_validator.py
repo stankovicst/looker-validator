@@ -19,6 +19,15 @@ from ..exceptions import LookerApiError, LookMLValidationError, ValidatorError
 
 logger = logging.getLogger(__name__)
 
+# Define severity levels
+SEVERITY_LEVELS = {
+    "success": 0,
+    "info": 10,
+    "warning": 20,
+    "error": 30,
+    "fatal": 40
+}
+
 
 class LookMLValidator(BaseValidator):
     """Validator for testing LookML syntax using the validate_project API endpoint."""

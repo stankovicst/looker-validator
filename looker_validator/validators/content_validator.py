@@ -1,4 +1,3 @@
-# FILE: looker_validator/validators/content_validator.py
 """
 Content validator: Uses Looker's content validation API.
 Properly excludes personal folders by default.
@@ -55,7 +54,8 @@ class ContentValidator(BaseValidator):
         all_errors: List[Dict[str, Any]] = []
 
         start_time = time.time()
-
+        result = ValidationResult(validator="content", status="passed")
+        
         try:
             # Get and filter explores relevant to this project
             all_explores = self._get_all_explores()

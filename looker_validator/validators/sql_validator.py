@@ -4,6 +4,7 @@ Based on user's original code, updated for new BaseValidator and error handling.
 Fixed ImportError for LookerValidationError.
 """
 
+import asyncio
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed

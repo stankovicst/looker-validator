@@ -5,6 +5,8 @@ Refactored based on the user's original looker_sdk-based code.
 Fixed AttributeError for SDK type hint.
 """
 
+import asyncio
+import hashlib
 import logging
 import time
 import hashlib

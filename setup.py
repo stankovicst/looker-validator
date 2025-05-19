@@ -63,7 +63,7 @@ setup(
     entry_points={
         # Kept exactly as provided by the user
         "console_scripts": [
-            "looker-validator=looker_validator.cli:main",
+            "looker-validator=looker_validator.async_cli:main",
         ],
     },
     # All metadata below kept exactly as provided by the user

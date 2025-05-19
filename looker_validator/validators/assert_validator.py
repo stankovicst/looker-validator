@@ -4,6 +4,7 @@ Assert validator: Runs LookML data tests (assertions).
 Corrected call to all_lookml_tests to remove unsupported 'fields' parameter.
 """
 
+import asyncio
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
