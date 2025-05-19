@@ -28,6 +28,7 @@ setup(
         "aiocache>=0.12.2",
         "httpx>=0.25.2",
         "pydantic>=2.5.2",
+        "rich>=13.3.0",
     ],
     extras_require={
         "dev": [
