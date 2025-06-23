@@ -5,7 +5,7 @@ import sys
 async def test_connection():
     print("Testing direct connection with aiohttp...")
     
-    base_url = "https://looker.mediamarktsaturn.com"
+    base_url = "https://looker.xxx.com"
     client_id = "xxx"
     client_secret = "xxx"
     
