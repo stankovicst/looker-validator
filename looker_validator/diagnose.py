@@ -6,8 +6,8 @@ async def test_connection():
     print("Testing direct connection with aiohttp...")
     
     base_url = "https://looker.mediamarktsaturn.com"
-    client_id = "pwcMFRh3C6K5D6XHthMt"
-    client_secret = "6h7PsqG7Xg73SRK8288Kkn2b"
+    client_id = "xxx"
+    client_secret = "xxx"
     
     # Test different URL formats
     urls_to_test = [
